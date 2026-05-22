@@ -20,7 +20,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y rclone
 
-    - - name: Configurar archivo de Rclone
+    - name: Configurar archivo de Rclone
       run: |
         mkdir -p ~/.config/rclone
         cat << 'EOF' > ~/.config/rclone/rclone.conf
