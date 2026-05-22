@@ -20,10 +20,12 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y rclone
 
-    - name: Configurar archivo de Rclone
+    - - name: Configurar archivo de Rclone
       run: |
         mkdir -p ~/.config/rclone
-        echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
+        cat << 'EOF' > ~/.config/rclone/rclone.conf
+        ${{ secrets.RCLONE_CONF }}
+        EOF
 
     - name: Crear carpetas de trabajo locales
       run: |
