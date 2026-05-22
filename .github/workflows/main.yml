@@ -14,26 +14,26 @@ jobs:
     - name: Descargar el código
       uses: actions/checkout@v4
 
-    - name: Configurar archivo de Rclone (Seguridad)
+    # --- NUEVO PASO: Instalar Rclone ---
+    - name: Instalar Rclone
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y rclone
+
+    - name: Configurar archivo de Rclone
       run: |
         mkdir -p ~/.config/rclone
         echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
 
-    - name: Crear carpetas de trabajo
+    - name: Crear carpetas de trabajo locales
       run: |
         mkdir -p datos_entrada
         mkdir -p datos_salida
 
-    - name: Descargar CSVs de Uber (Bronze Input)
-      # Usa el ID de la carpeta que tenías en tu código original
+    - name: Descargar CSVs de prueba (Input)
+      # REEMPLAZA EL ID DE ABAJO por el ID de tu carpeta "Uber_Test_Entrada"
       run: |
-        rclone copy "gdrive:" datos_entrada/ --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY -v
-
-    - name: Descargar Histórico Parquet (Si existe)
-      # Intentamos bajar el raw_rides.parquet de ayer para no re-procesar todo
-      # Cambia "Uber Riders TEST" por el nombre exacto de la carpeta en tu Drive
-      run: |
-        rclone copy "gdrive:Uber Riders TEST/rides_raw.parquet" datos_salida/ || true
+        rclone copy "gdrive:" datos_entrada/ --drive-root-folder-id 1IM3FtnTroA3ofiKs7DX5z0HSiX4ssCqG -v
 
     - name: Configurar Python
       uses: actions/setup-python@v5
@@ -48,7 +48,7 @@ jobs:
     - name: Ejecutar el procesamiento
       run: python proceso_completo_uber.py
 
-    - name: Subir Resultados a Drive (Gold/Silver Output)
-      # Sube todos los archivos de la carpeta datos_salida/ (HTML, CSV, Parquets) a la carpeta de Drive
+    - name: Subir Resultados a Drive de prueba (Output)
+      # REEMPLAZA EL ID DE ABAJO por el ID de tu carpeta "Uber_Test_Salida"
       run: |
-        rclone copy datos_salida/ "gdrive:Uber Riders TEST/" -v
+        rclone copy datos_salida/ "gdrive:" --drive-root-folder-id 1VZIIp6HfmYmGTGTcsV0-4dJsYpxejic6 -v
