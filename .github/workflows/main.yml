@@ -7,24 +7,48 @@ on:
   workflow_dispatch: # Esto te permite ejecutarlo manualmente desde GitHub si quieres probarlo antes
 
 jobs:
-  run-script:
+  run-pipeline:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Descargar el codigo del repositorio
+    - name: Descargar el código
       uses: actions/checkout@v4
+
+    - name: Configurar archivo de Rclone (Seguridad)
+      run: |
+        mkdir -p ~/.config/rclone
+        echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
+
+    - name: Crear carpetas de trabajo
+      run: |
+        mkdir -p datos_entrada
+        mkdir -p datos_salida
+
+    - name: Descargar CSVs de Uber (Bronze Input)
+      # Usa el ID de la carpeta que tenías en tu código original
+      run: |
+        rclone copy "gdrive:" datos_entrada/ --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY -v
+
+    - name: Descargar Histórico Parquet (Si existe)
+      # Intentamos bajar el raw_rides.parquet de ayer para no re-procesar todo
+      # Cambia "Uber Riders TEST" por el nombre exacto de la carpeta en tu Drive
+      run: |
+        rclone copy "gdrive:Uber Riders TEST/rides_raw.parquet" datos_salida/ || true
 
     - name: Configurar Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10' # Puedes cambiarlo por la versión que uses
+        python-version: '3.10'
 
-    - name: Instalar librerias necesarias
+    - name: Instalar librerías
       run: |
         python -m pip install --upgrade pip
-        # Aquí abajo escribe las librerías que usaba tu Colab (ejemplo: pandas, requests)
-        # Si no usabas librerías externas, puedes borrar las líneas de abajo
-        pip install pandas requests
+        pip install polars pyarrow
 
-    - name: Ejecutar el script de Python
+    - name: Ejecutar el procesamiento
       run: python proceso_completo_uber.py
+
+    - name: Subir Resultados a Drive (Gold/Silver Output)
+      # Sube todos los archivos de la carpeta datos_salida/ (HTML, CSV, Parquets) a la carpeta de Drive
+      run: |
+        rclone copy datos_salida/ "gdrive:Uber Riders TEST/" -v
