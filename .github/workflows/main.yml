@@ -27,4 +27,4 @@ jobs:
         pip install pandas requests
 
     - name: Ejecutar el script de Python
-      run: python script.py
+      run: python proceso_completo_uber.py
