@@ -2,7 +2,7 @@ name: Ejecucion Diaria de Script
 
 on:
   schedule:
-    - cron: '13 06 * * *'
+    - cron: '13 04 * * *'
   workflow_dispatch:
 
 jobs:
