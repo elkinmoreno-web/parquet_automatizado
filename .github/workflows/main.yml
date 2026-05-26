@@ -2,7 +2,7 @@ name: Ejecucion Diaria de Script
 
 on:
   schedule:
-    - cron: '13 04 * * *'
+    - cron: '25 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -34,7 +34,7 @@ jobs:
     - name: Descargar CSVs de prueba (Input)
       # REEMPLAZA EL ID DE ABAJO por el ID de tu carpeta "Uber_Test_Entrada"
       run: |
-        rclone copy "gdrive:" datos_entrada/ --drive-root-folder-id 1IM3FtnTroA3ofiKs7DX5z0HSiX4ssCqG -v
+        rclone copy "gdrive:" datos_entrada/ --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY -v
 
     - name: Configurar Python
       uses: actions/setup-python@v5
@@ -52,4 +52,4 @@ jobs:
     - name: Subir Resultados a Drive de prueba (Output)
       # REEMPLAZA EL ID DE ABAJO por el ID de tu carpeta "Uber_Test_Salida"
       run: |
-        rclone copy datos_salida/ "gdrive:" --drive-root-folder-id 1VZIIp6HfmYmGTGTcsV0-4dJsYpxejic6 -v
+        rclone copy datos_salida/ "gdrive:" --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
