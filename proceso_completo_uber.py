@@ -104,7 +104,7 @@ def parse_csv(filepath, file_name, file_ts):
     with open(filepath, 'rb') as f:
         content = f.read()
         
-    df = pl.read_csv(io.BytesIO(content), infer_schema_length=10000, try_parse_dates=False, null_values=['', 'NA', 'null', 'NULL'])
+    df = pl.read_csv(io.BytesIO(content), infer_schema_length=10000, try_parse_dates=False, null_values=['', 'NA', 'null', 'NULL', r'\N'], schema_overrides=text_overrides)
     for col in CANONICAL_COLUMNS:
         if col not in df.columns:
             if col in DATE_COLS: df = df.with_columns(pl.lit(None).cast(pl.Datetime).alias(col))
