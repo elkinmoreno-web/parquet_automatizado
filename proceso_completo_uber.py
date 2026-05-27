@@ -103,6 +103,8 @@ DATE_COLS = {'weekstr', 'datestr'}
 def parse_csv(filepath, file_name, file_ts):
     with open(filepath, 'rb') as f:
         content = f.read()
+
+    text_overrides = {col: pl.Utf8 for col in TEXT_COLS}
         
     df = pl.read_csv(io.BytesIO(content), infer_schema_length=10000, try_parse_dates=False, null_values=['', 'NA', 'null', 'NULL', r'\N'], schema_overrides=text_overrides)
     for col in CANONICAL_COLUMNS:
