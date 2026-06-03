@@ -36,10 +36,13 @@ OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'datos_salida')
 # Nombre del parquet final (en staging usamos otro para no pisar producción)
 SILVER_NAME = os.environ.get('SILVER_NAME', 'rides_silver')
 
+# Sufijo para los bronze (en staging '_STAGING' para no mezclar con producción)
+BRONZE_SUFFIX = os.environ.get('BRONZE_SUFFIX', '')
+
 # Parquets de histórico (bronze incremental)
-BRONZE_DAILY_PARQUET = os.path.join(OUTPUT_DIR, 'bronze_daily.parquet')
-BRONZE_CONN_PARQUET  = os.path.join(OUTPUT_DIR, 'bronze_connections.parquet')
-BRONZE_RTA_PARQUET   = os.path.join(OUTPUT_DIR, 'bronze_rta.parquet')
+BRONZE_DAILY_PARQUET = os.path.join(OUTPUT_DIR, 'bronze_daily' + BRONZE_SUFFIX + '.parquet')
+BRONZE_CONN_PARQUET  = os.path.join(OUTPUT_DIR, 'bronze_connections' + BRONZE_SUFFIX + '.parquet')
+BRONZE_RTA_PARQUET   = os.path.join(OUTPUT_DIR, 'bronze_rta' + BRONZE_SUFFIX + '.parquet')
 
 # Salidas finales
 SILVER_PARQUET = os.path.join(OUTPUT_DIR, SILVER_NAME + '.parquet')
