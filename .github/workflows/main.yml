@@ -1,11 +1,11 @@
 name: Pipeline STAGING (pruebas)
 
-# Solo corre manualmente o en la rama staging — NO toca producción.
+# Solo manual o en la rama staging — NO toca producción.
 on:
-  workflow_dispatch:        # botón "Run workflow" en la pestaña Actions
+  workflow_dispatch:
   push:
     branches:
-      - staging             # se ejecuta al hacer push a la rama staging
+      - staging
 
 jobs:
   run-staging:
@@ -27,28 +27,36 @@ jobs:
           ${{ secrets.RCLONE_CONF }}
           EOF
 
-      - name: Crear carpetas de trabajo locales
+      - name: Crear carpetas de trabajo
         run: |
-          mkdir -p COURIER_DAILY
-          mkdir -p CONNECTIONS
-          mkdir -p CANCELLATIONS_RTA
-          mkdir -p datos_salida
+          mkdir -p COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA datos_salida
 
-      # --- Descargar las 3 fuentes desde sus carpetas de Drive ---
-      - name: Descargar COURIER_DAILY
+      # 1. BAJAR EL BRONZE EXISTENTE (histórico). Si no existe, no falla.
+      - name: Bajar bronze existente desde Drive
+        run: |
+          rclone copy "gdrive:" datos_salida/ \
+            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ \
+            --include "bronze_*_STAGING.parquet" \
+            --transfers 8 --checkers 8 -v || echo "Sin bronce previo (primera corrida)"
+
+      # 2. BAJAR SOLO CSVs RECIENTES (paralelo + últimos 25 días)
+      - name: Descargar COURIER_DAILY (reciente)
         run: |
           rclone copy "gdrive:" COURIER_DAILY/ \
-            --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY -v
+            --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY \
+            --transfers 32 --checkers 32 --fast-list --max-age 25d -v
 
-      - name: Descargar CONNECTIONS
+      - name: Descargar CONNECTIONS (reciente)
         run: |
           rclone copy "gdrive:" CONNECTIONS/ \
-            --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 -v
+            --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 \
+            --transfers 32 --checkers 32 --fast-list --max-age 25d -v
 
-      - name: Descargar CANCELLATIONS_RTA
+      - name: Descargar CANCELLATIONS_RTA (reciente)
         run: |
           rclone copy "gdrive:" CANCELLATIONS_RTA/ \
-            --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u -v
+            --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u \
+            --transfers 32 --checkers 32 --fast-list --max-age 25d -v
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -60,14 +68,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install polars pyarrow
 
-      # --- Ejecutar el pipeline nuevo con nombre de salida de STAGING ---
+      # 3. EJECUTAR PIPELINE (bronce viejo + CSVs nuevos → actualiza)
       - name: Ejecutar pipeline STAGING
         env:
           SILVER_NAME: rides_silver_STAGING
+          BRONZE_SUFFIX: _STAGING
         run: python pipeline_v4_rta.py
 
-      # --- Subir SOLO el parquet de staging (no pisa rides_silver.parquet) ---
-      - name: Subir parquet STAGING a Drive
+      # 4. SUBIR BRONZE ACTUALIZADO + resultado (NO toca producción)
+      - name: Subir bronce actualizado a Drive
+        run: |
+          rclone copy datos_salida/ "gdrive:" \
+            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ \
+            --include "bronze_*_STAGING.parquet" \
+            --transfers 8 --checkers 8 -v
+
+      - name: Subir resultado STAGING a Drive
         run: |
           rclone copy datos_salida/rides_silver_STAGING.parquet "gdrive:" \
             --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
@@ -76,7 +92,6 @@ jobs:
           rclone copy datos_salida/dashboard.html "gdrive:" \
             --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
 
-      # --- Guardar también como artifact descargable desde GitHub ---
       - name: Guardar resultados como artifact
         uses: actions/upload-artifact@v4
         with:
