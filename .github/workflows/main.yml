@@ -1,55 +1,87 @@
-name: Ejecucion Diaria de Script
+name: Pipeline STAGING (pruebas)
 
+# Solo corre manualmente o en la rama staging — NO toca producción.
 on:
-  schedule:
-    - cron: '25 * * * *'
-  workflow_dispatch:
+  workflow_dispatch:        # botón "Run workflow" en la pestaña Actions
+  push:
+    branches:
+      - staging             # se ejecuta al hacer push a la rama staging
 
 jobs:
-  run-pipeline:
+  run-staging:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Descargar el código
-      uses: actions/checkout@v4
+      - name: Descargar el código
+        uses: actions/checkout@v4
 
-    # --- NUEVO PASO: Instalar Rclone ---
-    - name: Instalar Rclone
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y rclone
+      - name: Instalar Rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
 
-    - name: Configurar archivo de Rclone
-      run: |
-        mkdir -p ~/.config/rclone
-        cat << 'EOF' > ~/.config/rclone/rclone.conf
-        ${{ secrets.RCLONE_CONF }}
-        EOF
+      - name: Configurar archivo de Rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat << 'EOF' > ~/.config/rclone/rclone.conf
+          ${{ secrets.RCLONE_CONF }}
+          EOF
 
-    - name: Crear carpetas de trabajo locales
-      run: |
-        mkdir -p datos_entrada
-        mkdir -p datos_salida
+      - name: Crear carpetas de trabajo locales
+        run: |
+          mkdir -p COURIER_DAILY
+          mkdir -p CONNECTIONS
+          mkdir -p CANCELLATIONS_RTA
+          mkdir -p datos_salida
 
-    - name: Descargar CSVs de prueba (Input)
-      # REEMPLAZA EL ID DE ABAJO por el ID de tu carpeta "Uber_Test_Entrada"
-      run: |
-        rclone copy "gdrive:" datos_entrada/ --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY -v
+      # --- Descargar las 3 fuentes desde sus carpetas de Drive ---
+      - name: Descargar COURIER_DAILY
+        run: |
+          rclone copy "gdrive:" COURIER_DAILY/ \
+            --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY -v
 
-    - name: Configurar Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Descargar CONNECTIONS
+        run: |
+          rclone copy "gdrive:" CONNECTIONS/ \
+            --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 -v
 
-    - name: Instalar librerías
-      run: |
-        python -m pip install --upgrade pip
-        pip install polars pyarrow
+      - name: Descargar CANCELLATIONS_RTA
+        run: |
+          rclone copy "gdrive:" CANCELLATIONS_RTA/ \
+            --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u -v
 
-    - name: Ejecutar el procesamiento
-      run: python proceso_completo_uber.py
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Subir Resultados a Drive de prueba (Output)
-      # REEMPLAZA EL ID DE ABAJO por el ID de tu carpeta "Uber_Test_Salida"
-      run: |
-        rclone copy datos_salida/ "gdrive:" --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
+      - name: Instalar librerías
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars pyarrow
+
+      # --- Ejecutar el pipeline nuevo con nombre de salida de STAGING ---
+      - name: Ejecutar pipeline STAGING
+        env:
+          SILVER_NAME: rides_silver_STAGING
+        run: python pipeline_v4_rta.py
+
+      # --- Subir SOLO el parquet de staging (no pisa rides_silver.parquet) ---
+      - name: Subir parquet STAGING a Drive
+        run: |
+          rclone copy datos_salida/rides_silver_STAGING.parquet "gdrive:" \
+            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
+          rclone copy datos_salida/rides_silver_STAGING.csv "gdrive:" \
+            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
+          rclone copy datos_salida/dashboard.html "gdrive:" \
+            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
+
+      # --- Guardar también como artifact descargable desde GitHub ---
+      - name: Guardar resultados como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-resultados
+          path: |
+            datos_salida/rides_silver_STAGING.parquet
+            datos_salida/rides_silver_STAGING.csv
+            datos_salida/dashboard.html
