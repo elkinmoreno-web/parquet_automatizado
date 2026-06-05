@@ -73,7 +73,7 @@ jobs:
         env:
           SILVER_NAME: rides_silver_STAGING
           BRONZE_SUFFIX: _STAGING
-        run: python pipeline_v4_rta.py
+        run: python pipeline_v5_silver_movido.py
 
       # 4. SUBIR BRONZE ACTUALIZADO + resultado (NO toca producción)
       - name: Subir bronce actualizado a Drive
