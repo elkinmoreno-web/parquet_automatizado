@@ -1,254 +1,625 @@
 # -*- coding: utf-8 -*-
 """
-Proceso Automatizado Completo (Bronze ➔ Silver ➔ Dashboard)
-Adaptado para GitHub Actions + Rclone (Ejecución Local)
+Pipeline Closer Logistics — Viajes + Connections con regla de las 02:00
+=======================================================================
+VERSIÓN: v2.0-connections-only  (2026-06-02)
+
+  TODO se calcula desde Connections (viajes, horas, aceptados, cancelados,
+  % aceptación, % cancelación). El silver solo aporta metadatos del rider.
+  Días sin cobertura de Connections se descartan.
 """
+
+PIPELINE_VERSION = "v5.0-silver-movido-02h"
 
 import os
 import io
-import json
 import re
+import glob
+import json
 import gzip
 import base64
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, date, timedelta
 import polars as pl
 
-# --- CONFIGURACIÓN DE CARPETAS LOCALES ---
-# Rclone descargará los datos aquí y subirá los resultados desde aquí
-INPUT_DIR = 'datos_entrada'
-OUTPUT_DIR = 'datos_salida'
+# =============================================================================
+# CONFIGURACIÓN
+# =============================================================================
 
-os.makedirs(INPUT_DIR, exist_ok=True)
+# Carpetas de entrada (configurables por variable de entorno para staging)
+COURIER_DAILY_DIR = os.environ.get('COURIER_DAILY_DIR', 'COURIER_DAILY')
+CONNECTIONS_DIR   = os.environ.get('CONNECTIONS_DIR', 'CONNECTIONS')
+RTA_DIR           = os.environ.get('RTA_DIR', 'CANCELLATIONS_RTA')
+
+# Carpeta de salida
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'datos_salida')
+
+# Nombre del parquet final (en staging usamos otro para no pisar producción)
+SILVER_NAME = os.environ.get('SILVER_NAME', 'rides_silver')
+
+# Sufijo para los bronze (en staging '_STAGING' para no mezclar con producción)
+BRONZE_SUFFIX = os.environ.get('BRONZE_SUFFIX', '')
+
+# Parquets de histórico (bronze incremental)
+BRONZE_DAILY_PARQUET = os.path.join(OUTPUT_DIR, 'bronze_daily' + BRONZE_SUFFIX + '.parquet')
+BRONZE_CONN_PARQUET  = os.path.join(OUTPUT_DIR, 'bronze_connections' + BRONZE_SUFFIX + '.parquet')
+BRONZE_RTA_PARQUET   = os.path.join(OUTPUT_DIR, 'bronze_rta' + BRONZE_SUFFIX + '.parquet')
+
+# Salidas finales
+SILVER_PARQUET = os.path.join(OUTPUT_DIR, SILVER_NAME + '.parquet')
+SILVER_CSV     = os.path.join(OUTPUT_DIR, SILVER_NAME + '.csv')
+
+# Ventana de reproceso: cuántas semanas hacia atrás recalcular silver+ajuste.
+# 3 semanas cubre la regla de 2 semanas del dashboard + margen.
+REPROCESS_WEEKS = 3
+
+# Hora de corte del día lógico (registros antes de esto → día anterior)
+LOGICAL_DAY_CUTOFF_HOUR = 2
+
+# Patrones de archivo
+DAILY_PATTERN = re.compile(r'COURIER_DAILY.*\.csv$', re.IGNORECASE)
+CONN_PATTERN  = re.compile(r'connections.*\.csv$', re.IGNORECASE)
+RTA_PATTERN   = re.compile(r'CANCELLATION.*\.csv$', re.IGNORECASE)
+
+WORK_STATES = ['open', 'enroute', 'ontrip']
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+print('=' * 64)
+print(f'Pipeline Closer — {PIPELINE_VERSION}')
+print('=' * 64)
 
-MIN_FILE_DATE = '2026-03-13'
-FILE_PATTERN = re.compile(r'^COURIER_DAILY_CLOSERLOGISTICS_\d{8}_\d{6}\.csv$')
-
-PARQUET_FILENAME = 'rides_raw.parquet'
-SILVER_FILENAME = 'rides_silver.parquet'
-HTML_FILENAME = 'dashboard.html'
-CSV_FILENAME = 'rides_silver.csv'
-
-DASH_COLS = [
-    'datestr', 'weekstr', 'driver_uuid', 'driver_name', 'driver_email', 'driver_number',
-    'city_name', 'market_name', 'form_factor', 'online_hours', 'active_hours', 'open_hours',
-    'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours', 'num_of_trips', 'single_trips_total',
-    'late_p2_trips', 'late_p3_trips', 'accept_trips', 'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
-    'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min',
-]
-
-FACTORIZE = {'driver_uuid','driver_name','driver_email','driver_number',
-             'city_name','market_name','form_factor','datestr','weekstr'}
-
-print('Configuración local cargada.')
 
 # =============================================================================
-# 1. CAPA BRONZE (Ingesta local)
+# UTILIDADES
 # =============================================================================
 
 def extract_ts(name):
+    """Extrae timestamp de un nombre tipo ..._20260601_163355.csv"""
     m = re.search(r'(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})', name)
-    if not m: return None
+    if not m:
+        return None
     return datetime(*(int(x) for x in m.groups()))
 
-# 1.1 Listar CSVs locales (ya descargados por Rclone)
-all_files = os.listdir(INPUT_DIR)
-valid_files = []
-min_dt = datetime.fromisoformat(MIN_FILE_DATE) if MIN_FILE_DATE else None
 
-for fname in all_files:
-    if not FILE_PATTERN.match(fname): continue
-    ts = extract_ts(fname)
-    if ts is None or (min_dt and ts < min_dt): continue
-    valid_files.append({'name': fname, 'timestamp': ts})
+def detect_sep(path):
+    """Detecta si el CSV usa TAB o coma mirando la primera línea."""
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        first = f.readline()
+    return '\t' if first.count('\t') > first.count(',') else ','
 
-# Filtrar el más reciente por día
-archivos_por_dia = {}
-for f in valid_files:
-    dia = f['timestamp'].date()
-    if dia not in archivos_por_dia or f['timestamp'] > archivos_por_dia[dia]['timestamp']:
-        archivos_por_dia[dia] = f
 
-csvs = list(archivos_por_dia.values())
-csvs.sort(key=lambda f: f['timestamp'])
-print(f"CSVs únicos (1 por día) encontrados en local: {len(csvs)}")
+# =============================================================================
+# 1. BRONZE — COURIER_DAILY (incremental)
+# =============================================================================
 
-# 1.2 Ver qué ficheros ya están en el Parquet previo (si existe)
-existing_parquet_path = os.path.join(OUTPUT_DIR, PARQUET_FILENAME)
-processed_files = set()
-existing_df = None
-
-if os.path.exists(existing_parquet_path):
-    print("Parquet previo encontrado localmente. Leyendo historial...")
-    existing_df = pl.read_parquet(existing_parquet_path)
-    processed_files = set(existing_df['file_name'].unique().to_list())
-else:
-    print('No hay Parquet previo. Primera ejecución.')
-
-new_csvs = [f for f in csvs if f['name'] not in processed_files]
-print(f"CSVs nuevos a procesar: {len(new_csvs)}")
-
-# 1.3 Parsear CSVs
-CANONICAL_COLUMNS = [
+CANONICAL_DAILY = [
     'weekstr', 'datestr', 'driver_uuid', 'driver_name', 'driver_number', 'driver_email',
-    'fleet_name', 'city_id', 'city_name', 'market_name', 'form_factor', 'online_hours', 'active_hours', 'open_hours',
-    'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours', 'num_of_trips', 'single_trips_total',
-    'late_p2_trips', 'late_p3_trips', 'accept_trips', 'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
+    'fleet_name', 'city_id', 'city_name', 'market_name', 'form_factor',
+    'online_hours', 'active_hours', 'open_hours',
+    'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours',
+    'num_of_trips', 'single_trips_total', 'late_p2_trips', 'late_p3_trips',
+    'accept_trips', 'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
     'p2_km', 'p2_min', 'p2_km_avg', 'p2_min_avg', 'p3_km', 'p3_min', 'p3_km_avg', 'p3_min_avg',
     'total_km', 'total_min', 'total_km_avg', 'total_min_avg',
 ]
-TEXT_COLS = {'driver_uuid', 'driver_name', 'driver_number', 'driver_email', 'fleet_name', 'city_name', 'market_name', 'form_factor'}
-DATE_COLS = {'weekstr', 'datestr'}
+DAILY_TEXT = {'driver_uuid', 'driver_name', 'driver_number', 'driver_email',
+              'fleet_name', 'city_name', 'market_name', 'form_factor'}
+DAILY_DATE = {'weekstr', 'datestr'}
 
-def parse_csv(filepath, file_name, file_ts):
-    with open(filepath, 'rb') as f:
-        content = f.read()
 
-    text_overrides = {col: pl.Utf8 for col in TEXT_COLS}
-        
-    df = pl.read_csv(io.BytesIO(content), infer_schema_length=10000, try_parse_dates=False, null_values=['', 'NA', 'null', 'NULL', r'\N'], schema_overrides=text_overrides)
-    for col in CANONICAL_COLUMNS:
+def parse_daily_csv(filepath, file_name, file_ts):
+    sep = detect_sep(filepath)
+    df = pl.read_csv(
+        filepath, separator=sep, infer_schema_length=10000,
+        try_parse_dates=False, null_values=['', 'NA', 'null', 'NULL', '\\N'],
+        truncate_ragged_lines=True,
+    )
+    for col in CANONICAL_DAILY:
         if col not in df.columns:
-            if col in DATE_COLS: df = df.with_columns(pl.lit(None).cast(pl.Datetime).alias(col))
-            elif col in TEXT_COLS: df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias(col))
-            else: df = df.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
-            
-    df = df.select(CANONICAL_COLUMNS)
-    for col in DATE_COLS: df = df.with_columns(pl.col(col).str.to_datetime(strict=False).alias(col))
-    for col in CANONICAL_COLUMNS:
-        if col not in DATE_COLS and col not in TEXT_COLS:
+            if col in DAILY_DATE:   df = df.with_columns(pl.lit(None).cast(pl.Datetime).alias(col))
+            elif col in DAILY_TEXT: df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias(col))
+            else:                   df = df.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
+    df = df.select(CANONICAL_DAILY)
+    for col in DAILY_DATE:
+        df = df.with_columns(pl.col(col).str.to_datetime(strict=False).alias(col))
+    for col in CANONICAL_DAILY:
+        if col not in DAILY_DATE and col not in DAILY_TEXT:
             df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False))
-            
-    df = df.with_columns([pl.lit(file_name).alias('file_name'), pl.lit(file_ts).alias('file_date')])
+    df = df.with_columns([
+        pl.lit(file_name).alias('file_name'),
+        pl.lit(file_ts).alias('file_date'),
+    ])
     return df
 
-new_dfs = []
-for i, f in enumerate(new_csvs, 1):
-    try:
-        filepath = os.path.join(INPUT_DIR, f['name'])
-        print(f"[{i}/{len(new_csvs)}] {f['name']}...", end=' ')
-        df = parse_csv(filepath, f['name'], f['timestamp'])
-        new_dfs.append(df)
-        print(f"{len(df):,} filas")
-    except Exception as e:
-        print(f"ERROR: {e}")
 
-# 1.4 Concatenar y guardar
-if new_dfs:
-    new_all = pl.concat(new_dfs, how='vertical_relaxed')
-else:
-    new_all = None
+def ingest_bronze_daily():
+    # Histórico previo
+    processed = set()
+    existing = None
+    if os.path.exists(BRONZE_DAILY_PARQUET):
+        existing = pl.read_parquet(BRONZE_DAILY_PARQUET)
+        processed = set(existing['file_name'].unique().to_list())
+        print(f"[daily] Bronze previo: {len(existing):,} filas, {len(processed)} archivos ya procesados")
+    else:
+        print("[daily] Sin bronze previo (primera ejecución)")
 
-if existing_df is not None and new_all is not None: final_df = pl.concat([existing_df, new_all], how='vertical_relaxed')
-elif existing_df is not None: final_df = existing_df
-elif new_all is not None: final_df = new_all
-else: final_df = None
+    # Archivos en disco
+    files = []
+    for path in glob.glob(os.path.join(COURIER_DAILY_DIR, '*.csv')):
+        name = os.path.basename(path)
+        if not DAILY_PATTERN.search(name):
+            continue
+        files.append({'path': path, 'name': name, 'ts': extract_ts(name) or datetime.min})
 
-if final_df is not None:
-    # Guardar Bronze localmente
-    final_df.write_parquet(existing_parquet_path, compression='zstd')
-    print(f"Bronze Parquet guardado localmente: {existing_parquet_path}")
+    # Quedarse con el más reciente por día (igual que el pipeline viejo)
+    por_dia = {}
+    for f in files:
+        d = f['ts'].date()
+        if d not in por_dia or f['ts'] > por_dia[d]['ts']:
+            por_dia[d] = f
+    candidatos = sorted(por_dia.values(), key=lambda f: f['ts'])
+
+    nuevos = [f for f in candidatos if f['name'] not in processed]
+    print(f"[daily] Archivos nuevos a procesar: {len(nuevos)}")
+
+    new_dfs = []
+    for i, f in enumerate(nuevos, 1):
+        try:
+            df = parse_daily_csv(f['path'], f['name'], f['ts'])
+            new_dfs.append(df)
+            print(f"  [{i}/{len(nuevos)}] {f['name']}: {len(df):,} filas")
+        except Exception as e:
+            print(f"  [{i}/{len(nuevos)}] {f['name']}: ERROR {e}")
+
+    parts = []
+    if existing is not None: parts.append(existing)
+    if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
+    if not parts:
+        return None
+    bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
+    bronze.write_parquet(BRONZE_DAILY_PARQUET, compression='zstd')
+    print(f"[daily] Bronze guardado: {len(bronze):,} filas")
+    return bronze
 
 
 # =============================================================================
-# 2. CAPA SILVER (Deduplicación)
+# 2. BRONZE — CONNECTIONS (incremental)
 # =============================================================================
-if final_df is not None:
-    bronze = final_df
+
+CONN_COLS = ['courier_uuid', 'courier_name', 'contact_number', 'fleet_name', 'status',
+             'datestr', 'start_time', 'end_time', 'job_daily_rank']
+
+
+def parse_conn_csv(filepath, file_name):
+    sep = detect_sep(filepath)
+    # infer_schema=False lee TODO como texto. Evita errores como
+    # "could not parse 613368445.0 as i64" cuando el móvil viene con .0,
+    # o problemas si una columna mezcla tipos entre archivos. Convertimos
+    # los tipos que necesitemos a mano más abajo.
+    df = pl.read_csv(
+        filepath, separator=sep, infer_schema=False,
+        null_values=['', 'NA', 'null', 'NULL', '\\N'],
+        truncate_ragged_lines=True,
+    )
+    # Conservar solo columnas que nos interesan (si existen)
+    keep = [c for c in CONN_COLS if c in df.columns]
+    df = df.select(keep)
+    # Normalizar tipos clave a texto para dedup estable
+    for c in ['courier_uuid', 'status', 'start_time', 'end_time']:
+        if c in df.columns:
+            df = df.with_columns(pl.col(c).cast(pl.Utf8, strict=False))
+    df = df.with_columns(pl.lit(file_name).alias('conn_file'))
+    return df
+
+
+def ingest_bronze_connections():
+    processed = set()
+    existing = None
+    if os.path.exists(BRONZE_CONN_PARQUET):
+        existing = pl.read_parquet(BRONZE_CONN_PARQUET)
+        processed = set(existing['conn_file'].unique().to_list())
+        print(f"[conn] Bronze previo: {len(existing):,} filas, {len(processed)} archivos procesados")
+    else:
+        print("[conn] Sin bronze previo (primera ejecución)")
+
+    files = []
+    for path in glob.glob(os.path.join(CONNECTIONS_DIR, '*.csv')):
+        name = os.path.basename(path)
+        if not CONN_PATTERN.search(name):
+            continue
+        files.append({'path': path, 'name': name})
+
+    nuevos = [f for f in files if f['name'] not in processed]
+    print(f"[conn] Archivos nuevos a procesar: {len(nuevos)}")
+
+    new_dfs = []
+    for i, f in enumerate(nuevos, 1):
+        try:
+            df = parse_conn_csv(f['path'], f['name'])
+            new_dfs.append(df)
+            print(f"  [{i}/{len(nuevos)}] {f['name']}: {len(df):,} filas")
+        except Exception as e:
+            print(f"  [{i}/{len(nuevos)}] {f['name']}: ERROR {e}")
+
+    parts = []
+    if existing is not None: parts.append(existing)
+    if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
+    if not parts:
+        return None
+    bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
+
+    # Dedup incremental: (courier_uuid, start_time, status) — los archivos pueden solapar
+    before = len(bronze)
+    bronze = bronze.unique(subset=['courier_uuid', 'start_time', 'status'], keep='first')
+    print(f"[conn] Dedup: {before:,} → {len(bronze):,} filas")
+
+    bronze.write_parquet(BRONZE_CONN_PARQUET, compression='zstd')
+    print(f"[conn] Bronze guardado: {len(bronze):,} filas")
+    return bronze
+
+
+# =============================================================================
+# 2b. BRONZE — CANCELLATIONS_RTA (incremental) — pedidos individuales
+# =============================================================================
+
+RTA_COLS = ['timestamp', 'courier_uuid', 'offer_id', 'courier_action',
+            'contact_number', 'email', 'fleet_name']
+
+
+def parse_rta_csv(filepath, file_name):
+    sep = detect_sep(filepath)
+    df = pl.read_csv(
+        filepath, separator=sep, infer_schema=False,
+        null_values=['', 'NA', 'null', 'NULL', '\\N'],
+        truncate_ragged_lines=True,
+    )
+    keep = [c for c in RTA_COLS if c in df.columns]
+    df = df.select(keep)
+    df = df.with_columns(pl.lit(file_name).alias('rta_file'))
+    return df
+
+
+def ingest_bronze_rta():
+    processed = set()
+    existing = None
+    if os.path.exists(BRONZE_RTA_PARQUET):
+        existing = pl.read_parquet(BRONZE_RTA_PARQUET)
+        processed = set(existing['rta_file'].unique().to_list())
+        print(f"[rta] Bronze previo: {len(existing):,} filas, {len(processed)} archivos procesados")
+    else:
+        print("[rta] Sin bronze previo (primera ejecución)")
+
+    files = []
+    for path in glob.glob(os.path.join(RTA_DIR, '*.csv')):
+        name = os.path.basename(path)
+        if not RTA_PATTERN.search(name):
+            continue
+        files.append({'path': path, 'name': name})
+
+    nuevos = [f for f in files if f['name'] not in processed]
+    print(f"[rta] Archivos nuevos a procesar: {len(nuevos)}")
+
+    new_dfs = []
+    for i, f in enumerate(nuevos, 1):
+        try:
+            df = parse_rta_csv(f['path'], f['name'])
+            new_dfs.append(df)
+        except Exception as e:
+            print(f"  [{i}/{len(nuevos)}] {f['name']}: ERROR {e}")
+
+    parts = []
+    if existing is not None: parts.append(existing)
+    if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
+    if not parts:
+        return None
+    bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
+
+    # Dedup incremental por offer_id (cada pedido es único; archivos solapan)
+    before = len(bronze)
+    bronze = bronze.unique(subset=['offer_id'], keep='first')
+    print(f"[rta] Dedup por offer_id: {before:,} → {len(bronze):,} filas")
+
+    bronze.write_parquet(BRONZE_RTA_PARQUET, compression='zstd')
+    print(f"[rta] Bronze guardado: {len(bronze):,} filas")
+    return bronze
+
+
+# =============================================================================
+# 3. SILVER (dedup del daily) + recorte a ventana reciente
+# =============================================================================
+
+def reconstruct_rta(bronze_rta):
+    """
+    Calcula, por (courier_uuid, FECHA REAL), la FRACCIÓN de pedidos que ocurrió
+    antes de las 02:00 (madrugada). Esa fracción se usará para mover esa parte
+    de los totales del SILVER al día anterior.
+
+    Cada offer_id es un pedido individual. Solo contamos ACCEPT (pedidos que
+    aceptó). Cada pedido se ancla por su timestamp.
+      - frac_rta = pedidos ACCEPT de madrugada / pedidos ACCEPT totales del día
+    """
+    r = bronze_rta.with_columns(
+        pl.col('timestamp').str.to_datetime(strict=False).alias('ts')
+    ).filter(pl.col('ts').is_not_null())
+
+    # Solo ACCEPT (pedidos aceptados). FECHA REAL del calendario.
+    r = r.filter(pl.col('courier_action') == 'ACCEPT')
+    r = r.with_columns([
+        pl.col('ts').dt.date().alias('fecha_real'),
+        (pl.col('ts').dt.hour() < LOGICAL_DAY_CUTOFF_HOUR).alias('es_madrugada'),
+    ])
+
+    g = (
+        r.group_by(['courier_uuid', 'fecha_real']).agg([
+            pl.len().alias('rta_total'),
+            pl.col('es_madrugada').sum().alias('rta_madrugada'),
+        ])
+    )
+    g = g.with_columns(
+        pl.when(pl.col('rta_total') > 0)
+          .then(pl.col('rta_madrugada') / pl.col('rta_total'))
+          .otherwise(0.0).alias('frac_rta')
+    )
+    g = g.rename({'fecha_real': 'dia'})
+    return g.select(['courier_uuid', 'dia', 'frac_rta', 'rta_total', 'rta_madrugada'])
+
+
+# =============================================================================
+# SILVER
+# =============================================================================
+
+def build_silver(bronze_daily):
+    # Dedup por (driver_uuid, datestr). Criterio:
+    #   1) file_date más reciente (la última versión del dato)
+    #   2) si empatan en file_date (mismo timestamp en el nombre de dos archivos),
+    #      quedarse con la de mayor num_of_trips (la versión más completa)
+    #   3) garantía final: una sola fila por (uuid, día) con unique()
     silver = (
-        bronze
-        .with_columns(pl.col('file_date').max().over(['driver_uuid', 'datestr']).alias('_max_file_date'))
-        .filter(pl.col('file_date') == pl.col('_max_file_date'))
-        .drop('_max_file_date')
+        bronze_daily
+        .filter(pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null())
+        .sort(
+            ['driver_uuid', 'datestr', 'file_date', 'num_of_trips'],
+            descending=[False, False, True, True],
+            nulls_last=True,
+        )
+        .unique(subset=['driver_uuid', 'datestr'], keep='first', maintain_order=True)
     )
-    silver = silver.filter(pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null())
-    
-    # Guardar Silver Parquet y CSV localmente
-    silver_parquet_path = os.path.join(OUTPUT_DIR, SILVER_FILENAME)
-    silver_csv_path = os.path.join(OUTPUT_DIR, CSV_FILENAME)
-    
-    silver.write_parquet(silver_parquet_path, compression='zstd')
-    silver.write_csv(silver_csv_path)
-    print(f"Silver Parquet y CSV guardados localmente en: {OUTPUT_DIR}")
+
+    # Recorte a la ventana reciente para reprocesar rápido
+    max_day = silver.select(pl.col('datestr').max()).item()
+    if max_day is not None:
+        cutoff = max_day - timedelta(weeks=REPROCESS_WEEKS)
+        silver = silver.filter(pl.col('datestr') >= cutoff)
+        print(f"[silver] Ventana: {cutoff.date()} → {max_day.date()} ({len(silver):,} filas)")
+    return silver
 
 
 # =============================================================================
-# 3. DASHBOARD HTML
+# 4. AJUSTE desde CONNECTIONS (regla de las 02:00)
 # =============================================================================
-if 'silver' in locals() and silver is not None:
-    def build_payload(df):
-        columns, dicts = {}, {}
-        for col in df.columns:
-            values = df[col].to_list()
-            if col in FACTORIZE:
-                unique, idx_map, indices = [], {}, []
-                for v in values:
-                    if v is None:
-                        indices.append(-1)
-                        continue
-                    if v not in idx_map:
-                        idx_map[v] = len(unique)
-                        unique.append(v)
-                    indices.append(idx_map[v])
-                dicts[col] = unique
-                columns[col] = indices
-            else:
-                columns[col] = [round(v, 2) if v is not None else None for v in values]
-        return {'cols': columns, 'dicts': dicts}
 
-    def generate_weeks(min_date, max_date, lookback_weeks=8):
-        today = date.today()
-        end = max(max_date, today)
-        start = min_date - timedelta(days=lookback_weeks*7)
-        start -= timedelta(days=start.weekday())
-        weeks = []
-        cur = start
-        while cur <= end:
-            week_end = cur + timedelta(days=6)
-            iso = cur.isocalendar()
-            weeks.append({'week_num': iso[1] if isinstance(iso, tuple) else iso.week, 'year': iso[0] if isinstance(iso, tuple) else iso.year, 'start': cur.isoformat(), 'end': week_end.isoformat()})
-            cur += timedelta(days=7)
-        weeks.sort(key=lambda w: w['start'], reverse=True)
-        return weeks
+def reconstruct_connections(bronze_conn):
+    """
+    Calcula, por (courier_uuid, FECHA REAL), la FRACCIÓN de horas conectado
+    que ocurrió antes de las 02:00 (madrugada). Esa fracción se usará para mover
+    esa parte de las horas del SILVER al día anterior.
 
-    available_cols = [c for c in DASH_COLS if c in silver.columns]
-    date_cols_present = [c for c in ('datestr', 'weekstr') if c in available_cols]
-    df_dash = silver.select(available_cols)
-    for c in date_cols_present:
-        df_dash = df_dash.with_columns(pl.col(c).dt.strftime('%Y-%m-%d'))
+    Horas = duración de open+enroute+ontrip (filas con end válido).
+    Cada fila se ancla por su start_time.
+      - frac_horas = horas de madrugada / horas totales del día
+    """
+    conn = bronze_conn.with_columns([
+        pl.col('start_time').str.to_datetime(strict=False).alias('start_dt'),
+        pl.col('end_time').str.to_datetime(strict=False).alias('end_dt'),
+    ]).filter(pl.col('start_dt').is_not_null())
 
-    payload = build_payload(df_dash)
-    min_d = silver['datestr'].min().date()
-    max_d = silver['datestr'].max().date()
-    weeks = generate_weeks(min_d, max_d)
+    # Solo estados que cuentan como horas, con fin válido
+    conn = conn.filter(pl.col('status').is_in(WORK_STATES) & pl.col('end_dt').is_not_null())
+    conn = conn.with_columns([
+        pl.col('start_dt').dt.date().alias('fecha_real'),
+        (pl.col('start_dt').dt.hour() < LOGICAL_DAY_CUTOFF_HOUR).alias('es_madrugada'),
+        ((pl.col('end_dt') - pl.col('start_dt')).dt.total_seconds() / 3600).alias('dur_h'),
+    ])
 
-    meta = {
-        'total_rows': len(silver), 'n_drivers': silver['driver_uuid'].n_unique(),
-        'date_min': silver['datestr'].min().strftime('%Y-%m-%dT%H:%M:%S'), 'date_max': silver['datestr'].max().strftime('%Y-%m-%dT%H:%M:%S'),
-        'markets': sorted([m for m in silver['market_name'].unique().to_list() if m]), 'cities': sorted([c for c in silver['city_name'].unique().to_list() if c]),
-        'form_factors': sorted([f for f in silver['form_factor'].unique().to_list() if f]), 'weeks': weeks,
-        'generated_at': datetime.now(timezone.utc).isoformat(),
-    }
-
-    def compress_b64(obj):
-        raw = json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
-        gz = gzip.compress(raw, compresslevel=9)
-        return raw, gz, base64.b64encode(gz).decode('ascii')
-
-    data_raw, data_gz, data_b64 = compress_b64(payload)
-    meta_raw, meta_gz, meta_b64 = compress_b64(meta)
-
-    TEMPLATE_HTML = "<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n<meta charset=\"UTF-8\">\n<title>Riders \u00b7 Dashboard</title>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n<link href=\"https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..700&family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap\" rel=\"stylesheet\">\n<script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script>\n<script src=\"https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js\"></script>\n<script src=\"https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js\"></script>\n<style>\n:root {\n  --bg: #fafaf7;\n  --bg-elev: #ffffff;\n  --bg-elev-2: #f3f2ec;\n  --border: #e3e1d9;\n  --border-strong: #c9c6bc;\n  --text: #15171a;\n  --text-dim: #4a4d52;\n  --text-muted: #86878a;\n  --accent: #1a7d4c;\n  --accent-dark: #0e5a35;\n  --accent-2: #d85a2a;\n  --accent-3: #2a5f9e;\n  --accent-4: #e6b93a;\n  --good: #1a7d4c;\n  --bad: #c73b3b;\n  --shadow-sm: 0 1px 2px rgba(15, 17, 20, 0.04), 0 0 0 1px rgba(15, 17, 20, 0.03);\n  --shadow-md: 0 4px 14px rgba(15, 17, 20, 0.06), 0 0 0 1px rgba(15, 17, 20, 0.04);\n  --shadow-lg: 0 12px 40px rgba(15, 17, 20, 0.12), 0 0 0 1px rgba(15, 17, 20, 0.05);\n}\n* { box-sizing: border-box; margin: 0; padding: 0; }\nhtml, body {\n  background: var(--bg);\n  color: var(--text);\n  font-family: 'Inter', sans-serif;\n  font-size: 14px;\n  line-height: 1.5;\n  -webkit-font-smoothing: antialiased;\n  min-height: 100vh;\n}\n.mono { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }\n\n/* Header */\nheader {\n  border-bottom: 1px solid var(--border);\n  padding: 24px 32px 20px;\n  display: flex;\n  align-items: baseline;\n  justify-content: space-between;\n  gap: 24px;\n  flex-wrap: wrap;\n  background: var(--bg-elev);\n}\nheader h1 {\n  font-family: 'Fraunces', serif;\n  font-weight: 500;\n  font-size: 26px;\n  letter-spacing: -0.015em;\n}\nheader h1 em {\n  font-style: italic;\n  color: var(--accent);\n  font-weight: 400;\n}\n.subtitle {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 11px;\n  color: var(--text-muted);\n  text-transform: uppercase;\n  letter-spacing: 0.08em;\n  margin-top: 6px;\n}\n\n/* Filters */\n.filter-bar {\n  display: flex;\n  gap: 14px;\n  padding: 16px 32px;\n  border-bottom: 1px solid var(--border);\n  background: var(--bg-elev);\n  flex-wrap: wrap;\n  align-items: flex-end;\n}\n.filter-group { display: flex; flex-direction: column; gap: 5px; }\n.filter-group label {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 10px;\n  color: var(--text-muted);\n  text-transform: uppercase;\n  letter-spacing: 0.08em;\n  font-weight: 500;\n}\n.filter-group input, .filter-group select {\n  background: var(--bg-elev);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 6px;\n  padding: 7px 10px;\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 12px;\n  min-width: 130px;\n  transition: border-color 0.15s, box-shadow 0.15s;\n}\n.filter-group input:focus, .filter-group select:focus {\n  outline: none;\n  border-color: var(--accent);\n  box-shadow: 0 0 0 3px rgba(26, 125, 76, 0.12);\n}\n.filter-group.multi select { min-height: 32px; }\n.filter-group select#f-week {\n  min-width: 220px;\n  background: var(--bg-elev-2);\n  color: var(--text-dim);\n  font-size: 11px;\n}\n.filter-group select#f-week:focus { color: var(--text); }\n.checkbox-group {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  padding: 6px 0;\n}\n.checkbox-group input {\n  width: 15px; height: 15px;\n  accent-color: var(--accent);\n  cursor: pointer;\n}\n.checkbox-group label {\n  font-size: 12px;\n  color: var(--text-dim);\n  cursor: pointer;\n  line-height: 1.3;\n  max-width: 240px;\n}\n.spacer { flex: 1; }\n.btn {\n  background: var(--bg-elev);\n  color: var(--text-dim);\n  border: 1px solid var(--border-strong);\n  padding: 8px 14px;\n  border-radius: 6px;\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 11px;\n  text-transform: uppercase;\n  letter-spacing: 0.05em;\n  cursor: pointer;\n  transition: all 0.15s;\n  font-weight: 500;\n}\n.btn:hover { border-color: var(--text-dim); color: var(--text); }\n.btn.primary {\n  background: var(--accent);\n  color: #fff;\n  border-color: var(--accent);\n}\n.btn.primary:hover {\n  background: var(--accent-dark);\n  border-color: var(--accent-dark);\n}\n\n/* Tabs */\n.tabs {\n  display: flex;\n  gap: 0;\n  border-bottom: 1px solid var(--border);\n  padding: 0 32px;\n  background: var(--bg-elev);\n  position: sticky;\n  top: 0;\n  z-index: 20;\n}\n.tab {\n  padding: 16px 22px;\n  font-family: 'Fraunces', serif;\n  font-size: 15px;\n  font-weight: 500;\n  color: var(--text-muted);\n  cursor: pointer;\n  border: none;\n  border-bottom: 2px solid transparent;\n  transition: all 0.2s;\n  background: none;\n  margin-bottom: -1px;\n}\n.tab:hover { color: var(--text-dim); }\n.tab.active {\n  color: var(--text);\n  border-bottom-color: var(--accent);\n  font-style: italic;\n  font-weight: 600;\n}\n.tab-count {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 10px;\n  color: var(--text-muted);\n  margin-left: 6px;\n  font-style: normal;\n  font-weight: 400;\n}\n\n/* Main */\nmain { padding: 28px 32px 60px; max-width: 1600px; margin: 0 auto; }\n.tab-panel { display: none; animation: fadeIn 0.25s ease; }\n.tab-panel.active { display: block; }\n@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }\n\n/* KPI Cards */\n.kpi-grid {\n  display: grid;\n  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));\n  gap: 12px;\n  margin-bottom: 24px;\n}\n.kpi {\n  background: var(--bg-elev);\n  border: 1px solid var(--border);\n  border-radius: 10px;\n  padding: 18px 20px;\n  position: relative;\n  overflow: hidden;\n  transition: box-shadow 0.15s, border-color 0.15s;\n}\n.kpi:hover { box-shadow: var(--shadow-md); border-color: var(--border-strong); }\n.kpi::before {\n  content: '';\n  position: absolute;\n  top: 0; left: 0;\n  width: 3px; height: 100%;\n  background: var(--accent);\n}\n.kpi.alt::before { background: var(--accent-3); }\n.kpi.alt2::before { background: var(--accent-2); }\n.kpi.alt3::before { background: var(--accent-4); }\n.kpi-label {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 10px;\n  color: var(--text-muted);\n  text-transform: uppercase;\n  letter-spacing: 0.08em;\n  margin-bottom: 10px;\n  font-weight: 500;\n}\n.kpi-value {\n  font-family: 'Fraunces', serif;\n  font-size: 30px;\n  font-weight: 500;\n  letter-spacing: -0.02em;\n  line-height: 1;\n  color: var(--text);\n  font-variant-numeric: tabular-nums;\n}\n.kpi-value .unit {\n  font-size: 13px;\n  color: var(--text-muted);\n  font-style: italic;\n  margin-left: 3px;\n  font-weight: 400;\n}\n.kpi-sub {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 11px;\n  color: var(--text-dim);\n  margin-top: 6px;\n}\n\n/* Section title */\n.section-title {\n  font-family: 'Fraunces', serif;\n  font-size: 17px;\n  font-weight: 500;\n  margin: 28px 0 12px;\n  display: flex;\n  align-items: baseline;\n  gap: 10px;\n}\n.section-title:first-child { margin-top: 0; }\n.section-title .rule { flex: 1; height: 1px; background: var(--border); }\n\n/* Charts */\n.chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 14px; margin-bottom: 18px; }\n.chart-card {\n  background: var(--bg-elev);\n  border: 1px solid var(--border);\n  border-radius: 10px;\n  padding: 18px 18px 14px;\n  min-width: 0;\n}\n.chart-card h3 {\n  font-family: 'Fraunces', serif;\n  font-weight: 500;\n  font-size: 14px;\n  margin-bottom: 12px;\n  color: var(--text);\n}\n.chart-card h3 .hint {\n  font-family: 'JetBrains Mono', monospace;\n  font-weight: 400;\n  font-size: 10px;\n  color: var(--text-muted);\n  margin-left: 8px;\n  text-transform: uppercase;\n  letter-spacing: 0.05em;\n}\n.chart-area { min-height: 280px; width: 100%; }\n.chart-area.xtall { min-height: 600px; }\n\n/* Table */\n.table-wrapper {\n  background: var(--bg-elev);\n  border: 1px solid var(--border);\n  border-radius: 10px;\n  overflow: hidden;\n}\n.table-toolbar {\n  padding: 12px 16px;\n  border-bottom: 1px solid var(--border);\n  display: flex;\n  gap: 12px;\n  align-items: center;\n  flex-wrap: wrap;\n}\n.table-toolbar input {\n  background: var(--bg);\n  border: 1px solid var(--border-strong);\n  color: var(--text);\n  padding: 6px 10px;\n  border-radius: 6px;\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 12px;\n  flex: 1;\n  max-width: 340px;\n}\n.table-toolbar input:focus {\n  outline: none;\n  border-color: var(--accent);\n  box-shadow: 0 0 0 3px rgba(26, 125, 76, 0.12);\n}\n.table-meta {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 11px;\n  color: var(--text-muted);\n  margin-left: auto;\n}\n.scroll { max-height: 640px; overflow: auto; }\ntable { width: 100%; border-collapse: collapse; font-size: 12px; }\nthead {\n  position: sticky;\n  top: 0;\n  background: var(--bg-elev-2);\n  z-index: 1;\n}\nth {\n  text-align: left;\n  padding: 11px 12px;\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 10px;\n  font-weight: 600;\n  color: var(--text-dim);\n  text-transform: uppercase;\n  letter-spacing: 0.06em;\n  border-bottom: 1px solid var(--border);\n  cursor: pointer;\n  user-select: none;\n  white-space: nowrap;\n}\nth:hover { color: var(--text); background: #edebe4; }\nth.sorted-asc::after { content: ' \u2191'; color: var(--accent); }\nth.sorted-desc::after { content: ' \u2193'; color: var(--accent); }\nth.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }\ntd {\n  padding: 10px 12px;\n  border-bottom: 1px solid var(--border);\n  color: var(--text-dim);\n}\ntbody tr { cursor: pointer; transition: background 0.1s; }\ntbody tr:hover { background: #f3f2ec; }\ntbody tr:hover td { color: var(--text); }\ntd.mono { font-family: 'JetBrains Mono', monospace; color: var(--text); }\ntd.name { color: var(--text); font-weight: 500; }\ntd.name .email { color: var(--text-muted); font-size: 10px; font-family: 'JetBrains Mono', monospace; display: block; margin-top: 2px; font-weight: 400; }\ntd.pct-ok { color: var(--good); font-weight: 500; }\ntd.pct-warn { color: var(--accent-2); font-weight: 500; }\ntd.pct-bad { color: var(--bad); font-weight: 500; }\n\n/* Drawer (rider detail) */\n.drawer-backdrop {\n  position: fixed;\n  inset: 0;\n  background: rgba(15, 17, 20, 0.35);\n  opacity: 0;\n  pointer-events: none;\n  transition: opacity 0.2s;\n  z-index: 100;\n}\n.drawer-backdrop.open { opacity: 1; pointer-events: auto; }\n.drawer {\n  position: fixed;\n  top: 0; right: 0;\n  width: 480px;\n  max-width: 100vw;\n  height: 100vh;\n  background: var(--bg-elev);\n  box-shadow: var(--shadow-lg);\n  transform: translateX(100%);\n  transition: transform 0.25s ease;\n  z-index: 101;\n  overflow-y: auto;\n  display: flex;\n  flex-direction: column;\n}\n.drawer.open { transform: translateX(0); }\n.drawer-header {\n  padding: 22px 24px 18px;\n  border-bottom: 1px solid var(--border);\n  display: flex;\n  align-items: flex-start;\n  gap: 12px;\n}\n.drawer-close {\n  background: none; border: none;\n  font-size: 24px;\n  color: var(--text-muted);\n  cursor: pointer;\n  line-height: 1;\n  padding: 0;\n  margin-right: -4px;\n}\n.drawer-close:hover { color: var(--text); }\n.drawer-header h2 {\n  font-family: 'Fraunces', serif;\n  font-size: 20px;\n  font-weight: 600;\n  letter-spacing: -0.01em;\n  flex: 1;\n  line-height: 1.2;\n}\n.drawer-header .meta {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 11px;\n  color: var(--text-muted);\n  margin-top: 4px;\n}\n.drawer-body { padding: 0 24px 24px; }\n.drawer-donut { padding: 16px 0 8px; }\n.drawer-stats {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 10px;\n  margin: 12px 0;\n}\n.drawer-stat {\n  background: var(--bg-elev-2);\n  border-radius: 8px;\n  padding: 12px 14px;\n}\n.drawer-stat .label {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 10px;\n  color: var(--text-muted);\n  text-transform: uppercase;\n  letter-spacing: 0.05em;\n  margin-bottom: 4px;\n}\n.drawer-stat .value {\n  font-family: 'Fraunces', serif;\n  font-size: 22px;\n  font-weight: 500;\n  color: var(--text);\n  font-variant-numeric: tabular-nums;\n  line-height: 1.1;\n}\n.drawer-stat .value .unit {\n  font-size: 11px;\n  color: var(--text-muted);\n  font-style: italic;\n  margin-left: 2px;\n  font-weight: 400;\n}\n.drawer-stat .sub {\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 10px;\n  color: var(--text-dim);\n  margin-top: 2px;\n}\n.drawer-section-title {\n  font-family: 'Fraunces', serif;\n  font-size: 15px;\n  font-weight: 600;\n  margin: 20px 0 10px;\n  color: var(--text);\n}\n.drawer-list { font-family: 'JetBrains Mono', monospace; font-size: 11px; }\n.drawer-list .row {\n  display: flex;\n  justify-content: space-between;\n  gap: 12px;\n  padding: 6px 0;\n  border-bottom: 1px dashed var(--border);\n}\n.drawer-list .row:last-child { border-bottom: none; }\n.drawer-list .row .k { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; flex-shrink: 0; }\n.drawer-list .row .v { color: var(--text); font-weight: 500; text-align: right; word-break: break-word; }\n\n/* Empty / loading states */\n.empty, .loading {\n  padding: 60px 20px;\n  text-align: center;\n  color: var(--text-muted);\n  font-family: 'Fraunces', serif;\n  font-style: italic;\n  font-size: 15px;\n}\n\n/* Footer */\nfooter {\n  padding: 20px 32px;\n  border-top: 1px solid var(--border);\n  font-family: 'JetBrains Mono', monospace;\n  font-size: 10px;\n  color: var(--text-muted);\n  text-transform: uppercase;\n  letter-spacing: 0.06em;\n  display: flex;\n  justify-content: space-between;\n  flex-wrap: wrap;\n  gap: 16px;\n}\n\n@media (max-width: 640px) {\n  header, .filter-bar, .tabs, main, footer { padding-left: 16px; padding-right: 16px; }\n  .tab { padding: 14px 14px; font-size: 14px; }\n  .drawer { width: 100%; }\n}\n</style>\n</head>\n<body>\n\n<header>\n  <div>\n    <h1>Riders <em>/ dashboard</em></h1>\n    <div class=\"subtitle\" id=\"header-meta\">Cargando\u2026</div>\n  </div>\n</header>\n\n<div class=\"filter-bar\">\n  <div class=\"filter-group\">\n    <label>Semana</label>\n    <select id=\"f-week\">\n      <option value=\"\">\u2014</option>\n    </select>\n  </div>\n  <div class=\"filter-group\">\n    <label>Desde</label>\n    <input type=\"date\" id=\"f-date-from\">\n  </div>\n  <div class=\"filter-group\">\n    <label>Hasta</label>\n    <input type=\"date\" id=\"f-date-to\">\n  </div>\n  <div class=\"filter-group multi\">\n    <label>Ciudad</label>\n    <select id=\"f-city\" multiple size=\"1\"></select>\n  </div>\n  <div class=\"filter-group multi\">\n    <label>Market</label>\n    <select id=\"f-market\" multiple size=\"1\"></select>\n  </div>\n  <div class=\"filter-group multi\">\n    <label>Form factor</label>\n    <select id=\"f-formfactor\" multiple size=\"1\"></select>\n  </div>\n  <div class=\"checkbox-group\">\n    <input type=\"checkbox\" id=\"f-immature\">\n    <label for=\"f-immature\">Incluir \u00faltimos 2 d\u00edas (datos posiblemente incompletos)</label>\n  </div>\n  <div class=\"spacer\"></div>\n  <button class=\"btn\" id=\"btn-reset\">Reset</button>\n</div>\n\n<nav class=\"tabs\">\n  <button class=\"tab active\" data-tab=\"resumen\">Resumen</button>\n  <button class=\"tab\" data-tab=\"rider\">Por rider<span class=\"tab-count\" id=\"tab-count-rider\"></span></button>\n  <button class=\"tab\" data-tab=\"city\">Por ciudad<span class=\"tab-count\" id=\"tab-count-city\"></span></button>\n  <button class=\"tab\" data-tab=\"market\">Por market<span class=\"tab-count\" id=\"tab-count-market\"></span></button>\n  <button class=\"tab\" data-tab=\"evolucion\">Evoluci\u00f3n</button>\n  <button class=\"tab\" data-tab=\"raw\">Datos en bruto<span class=\"tab-count\" id=\"tab-count-raw\"></span></button>\n</nav>\n\n<main>\n  <!-- Resumen -->\n  <section class=\"tab-panel active\" id=\"panel-resumen\">\n    <div class=\"section-title\">Actividad <span class=\"rule\"></span></div>\n    <div class=\"kpi-grid\" id=\"kpi-grid-top\"></div>\n\n    <div class=\"section-title\">Eficiencia y calidad <span class=\"rule\"></span></div>\n    <div class=\"kpi-grid\" id=\"kpi-grid-quality\"></div>\n\n    <div class=\"section-title\">Tendencia diaria <span class=\"rule\"></span></div>\n    <div class=\"chart-grid\">\n      <div class=\"chart-card\">\n        <h3>N\u00ba de trips por d\u00eda</h3>\n        <div class=\"chart-area\" id=\"chart-trips-day\"></div>\n      </div>\n      <div class=\"chart-card\">\n        <h3>Horas online por d\u00eda</h3>\n        <div class=\"chart-area\" id=\"chart-hours-day\"></div>\n      </div>\n      <div class=\"chart-card\">\n        <h3>TPH \u00b7 Trips per Hour <span class=\"hint\">num_of_trips / horas online</span></h3>\n        <div class=\"chart-area\" id=\"chart-tph-day\"></div>\n      </div>\n      <div class=\"chart-card\">\n        <h3>% Cancelaci\u00f3n por d\u00eda <span class=\"hint\">cancel_trips / accept_trips</span></h3>\n        <div class=\"chart-area\" id=\"chart-cancel-day\"></div>\n      </div>\n    </div>\n  </section>\n\n  <!-- Por rider -->\n  <section class=\"tab-panel\" id=\"panel-rider\">\n    <div class=\"table-wrapper\">\n      <div class=\"table-toolbar\">\n        <input type=\"search\" id=\"search-rider\" placeholder=\"Buscar por nombre, email, UUID o tel\u00e9fono\u2026\">\n        <span class=\"table-meta\" id=\"meta-rider\"></span>\n        <button class=\"btn primary\" id=\"btn-export-rider\">\u2193 Descargar Excel</button>\n      </div>\n      <div class=\"scroll\">\n        <table id=\"table-rider\">\n          <thead>\n            <tr>\n              <th data-sort=\"driver_name\">Rider</th>\n              <th data-sort=\"markets\">Markets</th>\n              <th class=\"num\" data-sort=\"online_hours\">Horas online</th>\n              <th class=\"num\" data-sort=\"ontrip_p3_hours\">Horas P3</th>\n              <th class=\"num\" data-sort=\"num_of_trips\">Trips</th>\n              <th class=\"num\" data-sort=\"accept_trips\">Aceptados</th>\n              <th class=\"num\" data-sort=\"cancel_trips\">Cancel.</th>\n              <th class=\"num\" data-sort=\"cancel_rate\">% Cancel</th>\n              <th class=\"num\" data-sort=\"accept_rate\">% Acept.</th>\n              <th class=\"num\" data-sort=\"total_km\">Km</th>\n              <th class=\"num\" data-sort=\"trips_per_hour\">TPH</th>\n            </tr>\n          </thead>\n          <tbody></tbody>\n        </table>\n      </div>\n    </div>\n  </section>\n\n  <!-- Por ciudad -->\n  <section class=\"tab-panel\" id=\"panel-city\">\n    <div class=\"table-wrapper\">\n      <div class=\"table-toolbar\">\n        <input type=\"search\" id=\"search-city\" placeholder=\"Buscar ciudad\u2026\">\n        <span class=\"table-meta\" id=\"meta-city\"></span>\n      </div>\n      <div class=\"scroll\">\n        <table id=\"table-city\">\n          <thead>\n            <tr>\n              <th data-sort=\"city_name\">Ciudad</th>\n              <th class=\"num\" data-sort=\"markets\">Markets</th>\n              <th class=\"num\" data-sort=\"riders\">Riders</th>\n              <th class=\"num\" data-sort=\"online_hours\">Horas online</th>\n              <th class=\"num\" data-sort=\"ontrip_p3_hours\">Horas P3</th>\n              <th class=\"num\" data-sort=\"num_of_trips\">Trips</th>\n              <th class=\"num\" data-sort=\"accept_trips\">Aceptados</th>\n              <th class=\"num\" data-sort=\"cancel_trips\">Cancel.</th>\n              <th class=\"num\" data-sort=\"cancel_rate\">% Cancel</th>\n              <th class=\"num\" data-sort=\"total_km\">Km</th>\n              <th class=\"num\" data-sort=\"trips_per_hour\">TPH</th>\n            </tr>\n          </thead>\n          <tbody></tbody>\n        </table>\n      </div>\n    </div>\n  </section>\n\n  <!-- Por market -->\n  <section class=\"tab-panel\" id=\"panel-market\">\n    <div class=\"table-wrapper\" style=\"margin-bottom: 14px;\">\n      <div class=\"table-toolbar\">\n        <input type=\"search\" id=\"search-market\" placeholder=\"Buscar market\u2026\">\n        <span class=\"table-meta\" id=\"meta-market\"></span>\n      </div>\n      <div class=\"scroll\">\n        <table id=\"table-market\">\n          <thead>\n            <tr>\n              <th data-sort=\"market_name\">Market</th>\n              <th data-sort=\"city_name\">Ciudad</th>\n              <th class=\"num\" data-sort=\"riders\">Riders</th>\n              <th class=\"num\" data-sort=\"online_hours\">Horas online</th>\n              <th class=\"num\" data-sort=\"ontrip_p3_hours\">Horas P3</th>\n              <th class=\"num\" data-sort=\"num_of_trips\">Trips</th>\n              <th class=\"num\" data-sort=\"accept_trips\">Aceptados</th>\n              <th class=\"num\" data-sort=\"cancel_trips\">Cancel.</th>\n              <th class=\"num\" data-sort=\"cancel_rate\">% Cancel</th>\n              <th class=\"num\" data-sort=\"total_km\">Km</th>\n              <th class=\"num\" data-sort=\"trips_per_hour\">TPH</th>\n            </tr>\n          </thead>\n          <tbody></tbody>\n        </table>\n      </div>\n    </div>\n    <div class=\"chart-card\">\n      <h3>Trips por market <span class=\"hint\">todos los markets, ordenados por n\u00ba trips</span></h3>\n      <div class=\"chart-area\" id=\"chart-market-trips\"></div>\n    </div>\n  </section>\n\n  <!-- Evoluci\u00f3n -->\n  <section class=\"tab-panel\" id=\"panel-evolucion\">\n    <div class=\"filter-bar\" style=\"margin: -28px -32px 18px; background: transparent; border-bottom: none;\">\n      <div class=\"filter-group\">\n        <label>M\u00e9trica</label>\n        <select id=\"evol-metric\">\n          <option value=\"num_of_trips\">N\u00ba trips</option>\n          <option value=\"accept_trips\">N\u00ba aceptados</option>\n          <option value=\"online_hours\">Horas online</option>\n          <option value=\"active_hours\">Horas activas</option>\n          <option value=\"ontrip_p3_hours\">Horas P3 (on trip)</option>\n          <option value=\"total_km\">Km recorridos</option>\n          <option value=\"cancel_trips\">Cancelaciones</option>\n          <option value=\"reject_trips\">Rechazos</option>\n          <option value=\"trips_per_hour\">TPH (trips / h online)</option>\n          <option value=\"accept_rate\">% Aceptaci\u00f3n</option>\n          <option value=\"cancel_rate\">% Cancelaci\u00f3n</option>\n          <option value=\"riders\">N\u00ba riders \u00fanicos</option>\n        </select>\n      </div>\n      <div class=\"filter-group\">\n        <label>Agrupar por</label>\n        <select id=\"evol-group\">\n          <option value=\"none\">(Total)</option>\n          <option value=\"market_name\">Market</option>\n          <option value=\"form_factor\">Form factor</option>\n        </select>\n      </div>\n    </div>\n    <div class=\"chart-card\">\n      <div class=\"chart-area xtall\" id=\"chart-evolucion\"></div>\n    </div>\n  </section>\n\n  <!-- Datos en bruto -->\n  <section class=\"tab-panel\" id=\"panel-raw\">\n    <div class=\"table-wrapper\">\n      <div class=\"table-toolbar\">\n        <input type=\"search\" id=\"search-raw\" placeholder=\"Buscar por rider, market, email\u2026\">\n        <span class=\"table-meta\" id=\"meta-raw\"></span>\n        <button class=\"btn primary\" id=\"btn-export-raw\">\u2193 Descargar Excel</button>\n      </div>\n      <div class=\"scroll\" style=\"max-height: 680px;\">\n        <table id=\"table-raw\" style=\"font-size: 11px;\">\n          <thead id=\"thead-raw\"></thead>\n          <tbody></tbody>\n        </table>\n      </div>\n    </div>\n  </section>\n</main>\n\n<div class=\"drawer-backdrop\" id=\"drawer-backdrop\"></div>\n<aside class=\"drawer\" id=\"drawer\">\n  <div class=\"drawer-header\">\n    <div style=\"flex:1\">\n      <h2 id=\"drawer-name\">\u2014</h2>\n      <div class=\"meta\" id=\"drawer-meta\">\u2014</div>\n    </div>\n    <button class=\"drawer-close\" id=\"drawer-close\" title=\"Cerrar\">\u00d7</button>\n  </div>\n  <div class=\"drawer-body\" id=\"drawer-body\"></div>\n</aside>\n\n<footer>\n  <span>Riders dashboard \u00b7 generado autom\u00e1ticamente</span>\n  <span id=\"footer-meta\"></span>\n</footer>\n\n<script id=\"riders-data\" type=\"text/plain\">__DATA_B64__</script>\n<script id=\"riders-meta\" type=\"text/plain\">__META_B64__</script>\n\n<script>\n// Carga datos comprimidos (gzip + base64) usando pako para descomprimir.\n// Esto reduce el tama\u00f1o del HTML ~70% y evita que se vean los n\u00fameros en bruto.\nfunction loadCompressed(elementId) {\n  const b64 = document.getElementById(elementId).textContent.trim();\n  if (!b64) throw new Error(`Sin datos en #${elementId}`);\n  if (typeof pako === 'undefined') {\n    throw new Error('Pako no carg\u00f3. Comprueba la conexi\u00f3n a internet.');\n  }\n  const binary = Uint8Array.from(atob(b64), c => c.charCodeAt(0));\n  const json = pako.ungzip(binary, { to: 'string' });\n  return JSON.parse(json);\n}\n\nlet RAW, META;\ntry {\n  RAW = loadCompressed('riders-data');\n  META = loadCompressed('riders-meta');\n} catch (e) {\n  document.body.innerHTML = `<div style=\"padding:40px;font-family:system-ui;text-align:center;max-width:600px;margin:80px auto\"><h2 style=\"font-family:serif\">Error al cargar datos</h2><p style=\"color:#888\">${e.message}</p><p style=\"color:#888;font-size:13px;margin-top:24px\">Si el problema persiste, recarga la p\u00e1gina o comprueba que tengas conexi\u00f3n a internet.</p></div>`;\n  throw e;\n}\n\nconst ROWS = (() => {\n  const { cols, dicts } = RAW;\n  const n = cols.datestr.length;\n  const keys = Object.keys(cols);\n  const factorizedKeys = new Set(Object.keys(dicts));\n  const out = new Array(n);\n  for (let i = 0; i < n; i++) {\n    const row = {};\n    for (const k of keys) {\n      const v = cols[k][i];\n      row[k] = factorizedKeys.has(k) ? (v === -1 ? null : dicts[k][v]) : v;\n    }\n    out[i] = row;\n  }\n  return out;\n})();\n\n// Utils \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst fmt = {\n  int: n => isFinite(n) ? new Intl.NumberFormat('es-ES').format(Math.round(n)) : '\u2014',\n  dec: (n, d=2) => isFinite(n) ? new Intl.NumberFormat('es-ES', {minimumFractionDigits: d, maximumFractionDigits: d}).format(n) : '\u2014',\n  pct: (n, d=1) => isFinite(n) ? new Intl.NumberFormat('es-ES', {minimumFractionDigits: d, maximumFractionDigits: d}).format(n*100) + '%' : '\u2014',\n  date: d => d ? new Date(d).toLocaleDateString('es-ES', {day:'2-digit', month:'2-digit', year:'numeric'}) : '',\n  dateISO: d => d ? (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}` : String(d).slice(0,10)) : '',\n};\n\nfunction parseLocalDate(s) {\n  if (!s) return null;\n  const [y, m, d] = String(s).slice(0,10).split('-').map(Number);\n  return new Date(y, m - 1, d);\n}\nfunction daysAgo(n) { const d = new Date(); d.setDate(d.getDate() - n); d.setHours(0,0,0,0); return d; }\nfunction escapeHtml(s) {\n  if (s == null) return '';\n  return String(s).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\n}\nfunction pctClass(rate, type) {\n  if (!isFinite(rate)) return '';\n  if (type === 'cancel') return rate <= 0.05 ? 'pct-ok' : rate <= 0.15 ? 'pct-warn' : 'pct-bad';\n  return rate >= 0.95 ? 'pct-ok' : rate >= 0.8 ? 'pct-warn' : 'pct-bad';\n}\n\n// State \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst state = {\n  dateFrom: null, dateTo: null,\n  cities: new Set(), markets: new Set(), formFactors: new Set(),\n  includeImmature: false,\n  riderSearch: '', citySearch: '', marketSearch: '', rawSearch: '',\n  riderSort: {col: 'num_of_trips', dir: 'desc'},\n  citySort: {col: 'num_of_trips', dir: 'desc'},\n  marketSort: {col: 'num_of_trips', dir: 'desc'},\n  rawSort: {col: 'datestr', dir: 'desc'},\n  evolMetric: 'num_of_trips', evolGroup: 'none',\n  activeTab: 'resumen',\n  currentRiders: [],\n  currentRawRows: [],\n};\n\n// Plotly \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst PLOTLY_LAYOUT = {\n  paper_bgcolor: 'transparent',\n  plot_bgcolor: 'transparent',\n  font: { family: 'JetBrains Mono, monospace', size: 11, color: '#4a4d52' },\n  margin: { l: 56, r: 16, t: 10, b: 48 },\n  xaxis: { gridcolor: '#e3e1d9', linecolor: '#c9c6bc', zerolinecolor: '#c9c6bc', tickcolor: '#c9c6bc', tickfont: {size: 10} },\n  yaxis: { gridcolor: '#e3e1d9', linecolor: '#c9c6bc', zerolinecolor: '#c9c6bc', tickcolor: '#c9c6bc', tickfont: {size: 10} },\n  hoverlabel: { bgcolor: '#ffffff', bordercolor: '#c9c6bc', font: {family: 'JetBrains Mono, monospace', color: '#15171a', size: 11} },\n  legend: { font: { color: '#4a4d52', size: 10 }, bgcolor: 'transparent' },\n};\nconst PLOTLY_CONFIG = { responsive: true, displayModeBar: false };\nconst PALETTE = ['#1a7d4c', '#2a5f9e', '#d85a2a', '#e6b93a', '#7a3b9e', '#3a9eb3', '#b33a7c', '#5a8c2a', '#c73b3b', '#4a4d52'];\n\nfunction safePlot(id, data, layout, config) {\n  const el = document.getElementById(id);\n  if (!el) return;\n  if (typeof Plotly === 'undefined') {\n    el.innerHTML = '<div class=\"empty\">Plotly no disponible (\u00bfsin conexi\u00f3n?)</div>';\n    return;\n  }\n  try { Plotly.newPlot(el, data, layout, config || PLOTLY_CONFIG); }\n  catch (e) {\n    console.error('Plotly error:', e);\n    el.innerHTML = '<div class=\"empty\">Error al renderizar gr\u00e1fico</div>';\n  }\n}\n\n// Aggregation helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst SUM_METRICS = [\n  'online_hours', 'active_hours', 'open_hours', 'enroute_p2_hours', 'ontrip_p3_hours',\n  'unavailable_hours', 'num_of_trips', 'single_trips_total', 'late_p2_trips',\n  'late_p3_trips', 'accept_trips', 'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',\n  'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min',\n];\nfunction zeroAgg() { const o = {}; for (const k of SUM_METRICS) o[k] = 0; return o; }\nfunction sumInto(acc, r) { for (const k of SUM_METRICS) acc[k] += (+r[k] || 0); }\n\nfunction groupByKey(rows, keyFn) {\n  const map = new Map();\n  for (const r of rows) {\n    const k = keyFn(r);\n    if (k === null || k === undefined || k === '') continue;\n    if (!map.has(k)) map.set(k, []);\n    map.get(k).push(r);\n  }\n  return map;\n}\n\nfunction aggregateKpis(rows) {\n  const agg = zeroAgg();\n  const drivers = new Set();\n  for (const r of rows) {\n    sumInto(agg, r);\n    if (r.driver_uuid) drivers.add(r.driver_uuid);\n  }\n  agg.drivers = drivers.size;\n  agg.rows = rows.length;\n  agg.trips_per_hour = agg.online_hours > 0 ? agg.num_of_trips / agg.online_hours : 0;\n  // F\u00f3rmulas que coinciden con la app de Uber (siempre bounded 0-100%):\n  //   % Aceptaci\u00f3n = accept_trips / (accept_trips + reject_trips)\n  //   % Cancelaci\u00f3n = cancel_trips / accept_trips\n  // Nota: NO usar num_of_trips porque representa trips completados, no aceptados.\n  // accept_trips puede ser MAYOR que num_of_trips (algunas aceptaciones acaban canceladas).\n  const offered = agg.accept_trips + agg.reject_trips;\n  agg.accept_rate = offered > 0 ? agg.accept_trips / offered : NaN;\n  agg.cancel_rate = agg.accept_trips > 0 ? agg.cancel_trips / agg.accept_trips : NaN;\n  return agg;\n}\n\nfunction aggregateRiders(rows) {\n  const byDriver = groupByKey(rows, r => r.driver_uuid);\n  const result = [];\n  for (const [uuid, bucket] of byDriver) {\n    const agg = zeroAgg();\n    const markets = new Set();\n    const dates = new Set();\n    let info = {};\n    for (const r of bucket) {\n      sumInto(agg, r);\n      if (r.market_name) markets.add(r.market_name);\n      if (r.datestr) dates.add(r.datestr);\n      if (!info.driver_name && r.driver_name) {\n        info = {\n          driver_name: r.driver_name,\n          driver_email: r.driver_email,\n          driver_number: r.driver_number,\n          form_factor: r.form_factor,\n        };\n      }\n    }\n    const sortedDates = Array.from(dates).sort();\n    result.push({\n      driver_uuid: uuid,\n      driver_name: info.driver_name || '(sin nombre)',\n      driver_email: info.driver_email || '',\n      driver_number: info.driver_number || '',\n      form_factor: info.form_factor || '',\n      markets: markets.size,\n      markets_list: Array.from(markets).sort().join(', '),\n      days_active: dates.size,\n      first_date: sortedDates[0] || '',\n      last_date: sortedDates[sortedDates.length - 1] || '',\n      ...agg,\n      accept_rate: (agg.accept_trips + agg.reject_trips) > 0 ? agg.accept_trips / (agg.accept_trips + agg.reject_trips) : NaN,\n      cancel_rate: agg.accept_trips > 0 ? agg.cancel_trips / agg.accept_trips : NaN,\n      trips_per_hour: agg.online_hours > 0 ? agg.num_of_trips / agg.online_hours : 0,\n    });\n  }\n  return result;\n}\n\nfunction aggregateMarkets(rows) {\n  const byMarket = groupByKey(rows, r => r.market_name);\n  const result = [];\n  for (const [name, bucket] of byMarket) {\n    const agg = zeroAgg();\n    const drivers = new Set();\n    const cities = new Set();\n    for (const r of bucket) {\n      sumInto(agg, r);\n      if (r.driver_uuid) drivers.add(r.driver_uuid);\n      if (r.city_name) cities.add(r.city_name);\n    }\n    // Si un market aparece en varias ciudades (no deber\u00eda, pero por robustez),\n    // usamos la primera por orden alfab\u00e9tico.\n    const cityList = Array.from(cities).sort();\n    result.push({\n      market_name: name,\n      city_name: cityList.join(', ') || '',\n      riders: drivers.size,\n      ...agg,\n      cancel_rate: agg.accept_trips > 0 ? agg.cancel_trips / agg.accept_trips : NaN,\n      accept_rate: (agg.accept_trips + agg.reject_trips) > 0 ? agg.accept_trips / (agg.accept_trips + agg.reject_trips) : NaN,\n      trips_per_hour: agg.online_hours > 0 ? agg.num_of_trips / agg.online_hours : 0,\n    });\n  }\n  return result;\n}\n\nfunction aggregateCities(rows) {\n  const byCity = groupByKey(rows, r => r.city_name);\n  const result = [];\n  for (const [name, bucket] of byCity) {\n    const agg = zeroAgg();\n    const drivers = new Set();\n    const markets = new Set();\n    for (const r of bucket) {\n      sumInto(agg, r);\n      if (r.driver_uuid) drivers.add(r.driver_uuid);\n      if (r.market_name) markets.add(r.market_name);\n    }\n    result.push({\n      city_name: name,\n      markets: markets.size,\n      markets_list: Array.from(markets).sort().join(', '),\n      riders: drivers.size,\n      ...agg,\n      cancel_rate: agg.accept_trips > 0 ? agg.cancel_trips / agg.accept_trips : NaN,\n      accept_rate: (agg.accept_trips + agg.reject_trips) > 0 ? agg.accept_trips / (agg.accept_trips + agg.reject_trips) : NaN,\n      trips_per_hour: agg.online_hours > 0 ? agg.num_of_trips / agg.online_hours : 0,\n    });\n  }\n  return result;\n}\n\n// Init \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction init() {\n  const cutoff = daysAgo(2);\n  const from = new Date(cutoff); from.setDate(from.getDate() - 30);\n  document.getElementById('f-date-from').value = fmt.dateISO(from);\n  document.getElementById('f-date-to').value = fmt.dateISO(cutoff);\n\n  // Ciudades (META.cities) vienen del notebook. Si no est\u00e1, deducirlas de los datos.\n  const cities = (META.cities && META.cities.length) ? META.cities : deriveCities();\n  cities.forEach(c => {\n    const o = document.createElement('option'); o.value = c; o.textContent = c;\n    document.getElementById('f-city').appendChild(o);\n  });\n  // Markets: se re-poblan din\u00e1micamente seg\u00fan la ciudad seleccionada (filtro jer\u00e1rquico)\n  populateMarkets();\n  META.form_factors.forEach(f => {\n    const o = document.createElement('option'); o.value = f; o.textContent = f;\n    document.getElementById('f-formfactor').appendChild(o);\n  });\n\n  // Selector de semanas (pre-calculado desde Python en META.weeks)\n  const weekSel = document.getElementById('f-week');\n  (META.weeks || []).forEach(w => {\n    const o = document.createElement('option');\n    o.value = w.start + '|' + w.end;\n    const start = parseLocalDate(w.start);\n    const end = parseLocalDate(w.end);\n    const startStr = `${String(start.getDate()).padStart(2,'0')}/${String(start.getMonth()+1).padStart(2,'0')}`;\n    const endStr = `${String(end.getDate()).padStart(2,'0')}/${String(end.getMonth()+1).padStart(2,'0')}`;\n    o.textContent = `Sem ${w.week_num} \u00b7 ${startStr} \u2013 ${endStr}`;\n    weekSel.appendChild(o);\n  });\n  weekSel.addEventListener('change', e => {\n    const v = e.target.value;\n    if (!v) { onFilterChange(); return; }\n    const [s, ee] = v.split('|');\n    document.getElementById('f-date-from').value = s;\n    document.getElementById('f-date-to').value = ee;\n    // Si la semana incluye d\u00edas dentro del cutoff de immature, activamos el checkbox\n    // para que el usuario vea todos los d\u00edas de la semana sin sorpresas.\n    const cutoff = daysAgo(2);\n    const endDate = parseLocalDate(ee);\n    if (endDate && endDate > cutoff) {\n      document.getElementById('f-immature').checked = true;\n    }\n    onFilterChange();\n  });\n\n  // Al cambiar las fechas manualmente, resetear el selector de semana\n  ['f-date-from', 'f-date-to'].forEach(id => {\n    document.getElementById(id).addEventListener('change', () => {\n      document.getElementById('f-week').value = '';\n      onFilterChange();\n    });\n  });\n\n  document.getElementById('f-city').addEventListener('change', () => {\n    // Al cambiar ciudad, re-populamos markets y limpiamos la selecci\u00f3n de market\n    const prevMarkets = new Set(Array.from(document.getElementById('f-market').selectedOptions).map(o => o.value));\n    populateMarkets();\n    // Conservar la selecci\u00f3n anterior si esos markets siguen estando disponibles\n    Array.from(document.getElementById('f-market').options).forEach(o => {\n      if (prevMarkets.has(o.value)) o.selected = true;\n    });\n    onFilterChange();\n  });\n  document.getElementById('f-market').addEventListener('change', onFilterChange);\n  document.getElementById('f-formfactor').addEventListener('change', onFilterChange);\n  document.getElementById('f-immature').addEventListener('change', onFilterChange);\n  document.getElementById('btn-reset').addEventListener('click', resetFilters);\n  document.getElementById('btn-export-rider').addEventListener('click', exportRidersExcel);\n  document.getElementById('btn-export-raw').addEventListener('click', exportRawExcel);\n\n  document.getElementById('search-rider').addEventListener('input', e => { state.riderSearch = e.target.value.toLowerCase(); renderRiderTable(); });\n  document.getElementById('search-city').addEventListener('input', e => { state.citySearch = e.target.value.toLowerCase(); renderCityTable(); });\n  document.getElementById('search-market').addEventListener('input', e => { state.marketSearch = e.target.value.toLowerCase(); renderMarketTable(); });\n  document.getElementById('search-raw').addEventListener('input', e => { state.rawSearch = e.target.value.toLowerCase(); renderRawTable(); });\n\n  document.querySelectorAll('.tabs .tab').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));\n  document.querySelectorAll('#table-rider th[data-sort]').forEach(th => th.addEventListener('click', () => toggleSort('rider', th.dataset.sort)));\n  document.querySelectorAll('#table-city th[data-sort]').forEach(th => th.addEventListener('click', () => toggleSort('city', th.dataset.sort)));\n  document.querySelectorAll('#table-market th[data-sort]').forEach(th => th.addEventListener('click', () => toggleSort('market', th.dataset.sort)));\n  document.getElementById('evol-metric').addEventListener('change', e => { state.evolMetric = e.target.value; renderEvolucion(); });\n  document.getElementById('evol-group').addEventListener('change', e => { state.evolGroup = e.target.value; renderEvolucion(); });\n\n  buildRawTableHead();\n\n  document.getElementById('drawer-close').addEventListener('click', closeDrawer);\n  document.getElementById('drawer-backdrop').addEventListener('click', closeDrawer);\n  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });\n\n  let resizeTimer;\n  window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(resizePlots, 150); });\n\n  document.getElementById('header-meta').textContent =\n    `${fmt.int(META.total_rows)} filas \u00b7 ${fmt.int(META.n_drivers)} riders \u00b7 rango ${fmt.date(META.date_min)} \u2013 ${fmt.date(META.date_max)}`;\n  const ga = new Date(META.generated_at);\n  document.getElementById('footer-meta').textContent = `\u00daltima actualizaci\u00f3n: ${fmt.date(META.generated_at)} ${ga.toLocaleTimeString('es-ES')}`;\n\n  readFilters();\n  renderAll();\n}\n\n// Deduce lista de ciudades \u00fanicas si META no la tiene (fallback)\nfunction deriveCities() {\n  const set = new Set();\n  for (const r of ROWS) if (r.city_name) set.add(r.city_name);\n  return Array.from(set).sort();\n}\n\n// Mapa city \u2192 markets (construido una vez)\nconst CITY_TO_MARKETS = (() => {\n  const map = new Map();\n  for (const r of ROWS) {\n    if (!r.city_name || !r.market_name) continue;\n    if (!map.has(r.city_name)) map.set(r.city_name, new Set());\n    map.get(r.city_name).add(r.market_name);\n  }\n  return map;\n})();\n\n// Poblar selector de markets, filtrado por ciudades seleccionadas\nfunction populateMarkets() {\n  const marketSel = document.getElementById('f-market');\n  const selectedCities = new Set(Array.from(document.getElementById('f-city').selectedOptions).map(o => o.value));\n  // Determinar markets disponibles seg\u00fan ciudades seleccionadas\n  let available;\n  if (selectedCities.size === 0) {\n    available = META.markets;  // todos\n  } else {\n    const set = new Set();\n    for (const c of selectedCities) {\n      (CITY_TO_MARKETS.get(c) || new Set()).forEach(m => set.add(m));\n    }\n    available = Array.from(set).sort();\n  }\n  // Reconstruir opciones\n  marketSel.innerHTML = '';\n  available.forEach(m => {\n    const o = document.createElement('option'); o.value = m; o.textContent = m;\n    marketSel.appendChild(o);\n  });\n}\n\nfunction resetFilters() {\n  const cutoff = daysAgo(2);\n  const from = new Date(cutoff); from.setDate(from.getDate() - 30);\n  document.getElementById('f-date-from').value = fmt.dateISO(from);\n  document.getElementById('f-date-to').value = fmt.dateISO(cutoff);\n  document.getElementById('f-week').value = '';\n  Array.from(document.getElementById('f-city').options).forEach(o => o.selected = false);\n  populateMarkets();\n  Array.from(document.getElementById('f-market').options).forEach(o => o.selected = false);\n  Array.from(document.getElementById('f-formfactor').options).forEach(o => o.selected = false);\n  document.getElementById('f-immature').checked = false;\n  document.getElementById('search-rider').value = '';\n  document.getElementById('search-city').value = '';\n  document.getElementById('search-market').value = '';\n  document.getElementById('search-raw').value = '';\n  state.riderSearch = ''; state.citySearch = ''; state.marketSearch = ''; state.rawSearch = '';\n  onFilterChange();\n}\n\nfunction readFilters() {\n  state.dateFrom = parseLocalDate(document.getElementById('f-date-from').value);\n  state.dateTo = parseLocalDate(document.getElementById('f-date-to').value);\n  state.cities = new Set(Array.from(document.getElementById('f-city').selectedOptions).map(o => o.value));\n  state.markets = new Set(Array.from(document.getElementById('f-market').selectedOptions).map(o => o.value));\n  state.formFactors = new Set(Array.from(document.getElementById('f-formfactor').selectedOptions).map(o => o.value));\n  state.includeImmature = document.getElementById('f-immature').checked;\n}\n\nfunction onFilterChange() { readFilters(); renderAll(); }\n\nfunction filterRows() {\n  const cutoffImmature = daysAgo(2);\n  return ROWS.filter(r => {\n    if (!r.datestr) return false;\n    const d = parseLocalDate(r.datestr);\n    if (!d) return false;\n    if (state.dateFrom && d < state.dateFrom) return false;\n    if (state.dateTo && d > state.dateTo) return false;\n    if (!state.includeImmature && d > cutoffImmature) return false;\n    if (state.cities.size > 0 && !state.cities.has(r.city_name)) return false;\n    if (state.markets.size > 0 && !state.markets.has(r.market_name)) return false;\n    if (state.formFactors.size > 0 && !state.formFactors.has(r.form_factor)) return false;\n    return true;\n  });\n}\n\n// Render: Resumen \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderResumen(rows) {\n  const k = aggregateKpis(rows);\n\n  paintKpiGrid('kpi-grid-top', [\n    { label: 'Riders activos', value: fmt.int(k.drivers), sub: `${fmt.int(k.rows)} filas en total` },\n    { label: 'Trips', value: fmt.int(k.num_of_trips), alt: true },\n    { label: 'Aceptados', value: fmt.int(k.accept_trips), alt: true },\n    { label: 'Horas online', value: fmt.int(k.online_hours), unit: 'h' },\n    { label: 'Horas P3 (on trip)', value: fmt.int(k.ontrip_p3_hours), unit: 'h', sub: k.online_hours > 0 ? `${fmt.pct(k.ontrip_p3_hours/k.online_hours)} del online` : '' },\n    { label: 'Km recorridos', value: fmt.int(k.total_km), unit: 'km', alt: true },\n  ]);\n\n  paintKpiGrid('kpi-grid-quality', [\n    { label: 'TPH (trips/hora online)', value: fmt.dec(k.trips_per_hour, 2), alt3: true, sub: 'trips per hour' },\n    { label: '% Aceptaci\u00f3n', value: fmt.pct(k.accept_rate), sub: `${fmt.int(k.accept_trips)} aceptados / ${fmt.int(k.accept_trips + k.reject_trips)} ofertas` },\n    { label: '% Cancelaci\u00f3n', value: fmt.pct(k.cancel_rate), alt2: true, sub: `${fmt.int(k.cancel_trips)} cancel. / ${fmt.int(k.accept_trips)} aceptados` },\n    { label: 'Cancel. no fault', value: fmt.int(k.cancel_not_at_fault_trips), alt2: true, sub: k.cancel_trips > 0 ? `${fmt.pct(k.cancel_not_at_fault_trips / k.cancel_trips)} de cancel.` : '' },\n    { label: 'Rechazos', value: fmt.int(k.reject_trips), alt2: true },\n    { label: 'Trips tarde (P2+P3)', value: fmt.int(k.late_p2_trips + k.late_p3_trips), alt2: true },\n  ]);\n\n  const byDay = groupByKey(rows, r => r.datestr);\n  const sortedDays = Array.from(byDay.keys()).sort();\n  const daily = sortedDays.map(d => {\n    const bucket = byDay.get(d);\n    const a = zeroAgg();\n    for (const r of bucket) sumInto(a, r);\n    return {\n      day: d,\n      trips: a.num_of_trips,\n      online_hours: a.online_hours,\n      tph: a.online_hours > 0 ? a.num_of_trips / a.online_hours : 0,\n      cancel_rate: a.accept_trips > 0 ? a.cancel_trips / a.accept_trips : 0,\n    };\n  });\n  const x = sortedDays;\n  safePlot('chart-trips-day', [{ x, y: daily.map(d => d.trips), type: 'bar',\n    marker: { color: PALETTE[0] },\n    hovertemplate: '<b>%{x}</b><br>%{y:,} trips<extra></extra>' }], PLOTLY_LAYOUT);\n  safePlot('chart-hours-day', [{ x, y: daily.map(d => d.online_hours), type: 'bar',\n    marker: { color: PALETTE[1] },\n    hovertemplate: '<b>%{x}</b><br>%{y:,.0f} h<extra></extra>' }], PLOTLY_LAYOUT);\n  safePlot('chart-tph-day', [{ x, y: daily.map(d => d.tph), type: 'scatter', mode: 'lines+markers',\n    line: { color: PALETTE[3], width: 2.5 }, marker: { size: 6, color: PALETTE[3] },\n    hovertemplate: '<b>%{x}</b><br>%{y:.2f} TPH<extra></extra>' }], PLOTLY_LAYOUT);\n  safePlot('chart-cancel-day', [{ x, y: daily.map(d => d.cancel_rate * 100), type: 'bar',\n    marker: { color: PALETTE[2] },\n    hovertemplate: '<b>%{x}</b><br>%{y:.2f}%<extra></extra>' }],\n    { ...PLOTLY_LAYOUT, yaxis: { ...PLOTLY_LAYOUT.yaxis, ticksuffix: '%' } });\n}\n\nfunction paintKpiGrid(id, kpis) {\n  const grid = document.getElementById(id);\n  grid.innerHTML = '';\n  for (const kpi of kpis) {\n    const el = document.createElement('div');\n    el.className = 'kpi' + (kpi.alt ? ' alt' : '') + (kpi.alt2 ? ' alt2' : '') + (kpi.alt3 ? ' alt3' : '');\n    el.innerHTML = `\n      <div class=\"kpi-label\">${kpi.label}</div>\n      <div class=\"kpi-value\">${kpi.value}${kpi.unit ? `<span class=\"unit\">${kpi.unit}</span>` : ''}</div>\n      ${kpi.sub ? `<div class=\"kpi-sub\">${kpi.sub}</div>` : ''}\n    `;\n    grid.appendChild(el);\n  }\n}\n\n// Render: Rider \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderRiderTable() {\n  const rows = filterRows();\n  let riders = aggregateRiders(rows);\n\n  if (state.riderSearch) {\n    const q = state.riderSearch;\n    riders = riders.filter(r =>\n      (r.driver_name || '').toLowerCase().includes(q) ||\n      (r.driver_email || '').toLowerCase().includes(q) ||\n      (r.driver_uuid || '').toLowerCase().includes(q) ||\n      (r.driver_number || '').toLowerCase().includes(q)\n    );\n  }\n\n  const { col, dir } = state.riderSort;\n  const mult = dir === 'asc' ? 1 : -1;\n  riders.sort((a, b) => {\n    const va = a[col], vb = b[col];\n    if (typeof va === 'string') return mult * va.localeCompare(vb || '', 'es');\n    return mult * ((va || 0) - (vb || 0));\n  });\n\n  state.currentRiders = riders;\n\n  const total = aggregateRiders(rows).length;\n  document.getElementById('meta-rider').textContent = `${fmt.int(riders.length)} de ${fmt.int(total)} riders`;\n  document.getElementById('tab-count-rider').textContent = `(${fmt.int(total)})`;\n\n  const tbody = document.querySelector('#table-rider tbody');\n  tbody.innerHTML = '';\n  const frag = document.createDocumentFragment();\n  const MAX_ROWS = 500;\n  for (const r of riders.slice(0, MAX_ROWS)) {\n    const tr = document.createElement('tr');\n    tr.innerHTML = `\n      <td class=\"name\">${escapeHtml(r.driver_name)}<span class=\"email\">${escapeHtml(r.driver_email)}</span></td>\n      <td class=\"mono\" title=\"${escapeHtml(r.markets_list)}\">${fmt.int(r.markets)}</td>\n      <td class=\"num mono\">${fmt.dec(r.online_hours, 2)}</td>\n      <td class=\"num mono\">${fmt.dec(r.ontrip_p3_hours, 2)}</td>\n      <td class=\"num mono\">${fmt.int(r.num_of_trips)}</td>\n      <td class=\"num mono\">${fmt.int(r.accept_trips)}</td>\n      <td class=\"num mono\">${fmt.int(r.cancel_trips)}</td>\n      <td class=\"num mono ${pctClass(r.cancel_rate, 'cancel')}\">${fmt.pct(r.cancel_rate)}</td>\n      <td class=\"num mono ${pctClass(r.accept_rate, 'accept')}\">${fmt.pct(r.accept_rate)}</td>\n      <td class=\"num mono\">${fmt.dec(r.total_km, 1)}</td>\n      <td class=\"num mono\">${fmt.dec(r.trips_per_hour, 2)}</td>\n    `;\n    tr.addEventListener('click', () => openRiderDrawer(r));\n    frag.appendChild(tr);\n  }\n  tbody.appendChild(frag);\n  if (riders.length > MAX_ROWS) {\n    document.getElementById('meta-rider').textContent += ` \u00b7 mostrando top ${MAX_ROWS}`;\n  }\n  updateSortIndicators('rider');\n}\n\n// Export Excel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction exportRidersExcel() {\n  if (typeof XLSX === 'undefined') { alert('Librer\u00eda de Excel no disponible (\u00bfsin conexi\u00f3n?)'); return; }\n  const data = state.currentRiders;\n  if (!data.length) { alert('No hay riders para exportar'); return; }\n  const columns = [\n    { key: 'driver_name', label: 'Rider' },\n    { key: 'driver_email', label: 'Email' },\n    { key: 'driver_number', label: 'Tel\u00e9fono' },\n    { key: 'driver_uuid', label: 'UUID' },\n    { key: 'form_factor', label: 'Form factor' },\n    { key: 'markets', label: 'N\u00ba markets' },\n    { key: 'markets_list', label: 'Markets' },\n    { key: 'days_active', label: 'D\u00edas activos' },\n    { key: 'first_date', label: 'Primera fecha' },\n    { key: 'last_date', label: '\u00daltima fecha' },\n    { key: 'online_hours', label: 'Horas online', round: 2 },\n    { key: 'active_hours', label: 'Horas activas', round: 2 },\n    { key: 'open_hours', label: 'Horas disponible', round: 2 },\n    { key: 'enroute_p2_hours', label: 'Horas P2', round: 2 },\n    { key: 'ontrip_p3_hours', label: 'Horas P3', round: 2 },\n    { key: 'unavailable_hours', label: 'Horas no disp.', round: 2 },\n    { key: 'num_of_trips', label: 'N\u00ba trips' },\n    { key: 'single_trips_total', label: 'Single trips' },\n    { key: 'accept_trips', label: 'Trips aceptados' },\n    { key: 'reject_trips', label: 'Rechazos' },\n    { key: 'cancel_trips', label: 'Cancelaciones' },\n    { key: 'cancel_not_at_fault_trips', label: 'Cancel. no fault' },\n    { key: 'late_p2_trips', label: 'Late P2' },\n    { key: 'late_p3_trips', label: 'Late P3' },\n    { key: 'accept_rate', label: '% Aceptaci\u00f3n', pct: true },\n    { key: 'cancel_rate', label: '% Cancelaci\u00f3n', pct: true },\n    { key: 'trips_per_hour', label: 'TPH', round: 2 },\n    { key: 'p2_km', label: 'Km P2', round: 2 },\n    { key: 'p3_km', label: 'Km P3', round: 2 },\n    { key: 'total_km', label: 'Km totales', round: 2 },\n    { key: 'p2_min', label: 'Min P2', round: 1 },\n    { key: 'p3_min', label: 'Min P3', round: 1 },\n    { key: 'total_min', label: 'Min totales', round: 1 },\n  ];\n  const sheetData = data.map(r => {\n    const o = {};\n    for (const c of columns) {\n      let v = r[c.key];\n      if (v == null) v = '';\n      else if (c.pct) v = Number((v * 100).toFixed(2));\n      else if (c.round != null && typeof v === 'number') v = Number(v.toFixed(c.round));\n      o[c.label] = v;\n    }\n    return o;\n  });\n  const ws = XLSX.utils.json_to_sheet(sheetData, { header: columns.map(c => c.label) });\n  ws['!cols'] = columns.map(c => ({ wch: Math.max(c.label.length + 2, 10) }));\n  const wb = XLSX.utils.book_new();\n  XLSX.utils.book_append_sheet(wb, ws, 'Riders');\n  const n = new Date();\n  const fname = `riders_${n.getFullYear()}${String(n.getMonth()+1).padStart(2,'0')}${String(n.getDate()).padStart(2,'0')}_${String(n.getHours()).padStart(2,'0')}${String(n.getMinutes()).padStart(2,'0')}.xlsx`;\n  XLSX.writeFile(wb, fname);\n}\n\n// Render: City \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderCityTable() {\n  const rows = filterRows();\n  let cities = aggregateCities(rows);\n\n  if (state.citySearch) {\n    const q = state.citySearch;\n    cities = cities.filter(c => (c.city_name || '').toLowerCase().includes(q));\n  }\n  const { col, dir } = state.citySort;\n  const mult = dir === 'asc' ? 1 : -1;\n  cities.sort((a, b) => {\n    const va = a[col], vb = b[col];\n    if (typeof va === 'string') return mult * va.localeCompare(vb || '', 'es');\n    return mult * ((va || 0) - (vb || 0));\n  });\n\n  const total = aggregateCities(rows).length;\n  document.getElementById('meta-city').textContent = `${fmt.int(cities.length)} de ${fmt.int(total)} ciudades`;\n  document.getElementById('tab-count-city').textContent = `(${fmt.int(total)})`;\n\n  const tbody = document.querySelector('#table-city tbody');\n  tbody.innerHTML = '';\n  const frag = document.createDocumentFragment();\n  for (const c of cities) {\n    const tr = document.createElement('tr');\n    tr.innerHTML = `\n      <td class=\"name\">${escapeHtml(c.city_name)}</td>\n      <td class=\"num mono\" title=\"${escapeHtml(c.markets_list)}\">${fmt.int(c.markets)}</td>\n      <td class=\"num mono\">${fmt.int(c.riders)}</td>\n      <td class=\"num mono\">${fmt.dec(c.online_hours, 1)}</td>\n      <td class=\"num mono\">${fmt.dec(c.ontrip_p3_hours, 1)}</td>\n      <td class=\"num mono\">${fmt.int(c.num_of_trips)}</td>\n      <td class=\"num mono\">${fmt.int(c.accept_trips)}</td>\n      <td class=\"num mono\">${fmt.int(c.cancel_trips)}</td>\n      <td class=\"num mono ${pctClass(c.cancel_rate, 'cancel')}\">${fmt.pct(c.cancel_rate)}</td>\n      <td class=\"num mono\">${fmt.dec(c.total_km, 0)}</td>\n      <td class=\"num mono\">${fmt.dec(c.trips_per_hour, 2)}</td>\n    `;\n    frag.appendChild(tr);\n  }\n  tbody.appendChild(frag);\n  updateSortIndicators('city');\n}\n\n// Render: Market \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderMarketTable() {\n  const rows = filterRows();\n  let markets = aggregateMarkets(rows);\n\n  if (state.marketSearch) {\n    const q = state.marketSearch;\n    markets = markets.filter(m => (m.market_name || '').toLowerCase().includes(q));\n  }\n  const { col, dir } = state.marketSort;\n  const mult = dir === 'asc' ? 1 : -1;\n  markets.sort((a, b) => {\n    const va = a[col], vb = b[col];\n    if (typeof va === 'string') return mult * va.localeCompare(vb || '', 'es');\n    return mult * ((va || 0) - (vb || 0));\n  });\n\n  const total = aggregateMarkets(rows).length;\n  document.getElementById('meta-market').textContent = `${fmt.int(markets.length)} de ${fmt.int(total)} markets`;\n  document.getElementById('tab-count-market').textContent = `(${fmt.int(total)})`;\n\n  const tbody = document.querySelector('#table-market tbody');\n  tbody.innerHTML = '';\n  const frag = document.createDocumentFragment();\n  for (const m of markets) {\n    const tr = document.createElement('tr');\n    tr.innerHTML = `\n      <td class=\"name\">${escapeHtml(m.market_name)}</td>\n      <td class=\"mono\">${escapeHtml(m.city_name)}</td>\n      <td class=\"num mono\">${fmt.int(m.riders)}</td>\n      <td class=\"num mono\">${fmt.dec(m.online_hours, 1)}</td>\n      <td class=\"num mono\">${fmt.dec(m.ontrip_p3_hours, 1)}</td>\n      <td class=\"num mono\">${fmt.int(m.num_of_trips)}</td>\n      <td class=\"num mono\">${fmt.int(m.accept_trips)}</td>\n      <td class=\"num mono\">${fmt.int(m.cancel_trips)}</td>\n      <td class=\"num mono ${pctClass(m.cancel_rate, 'cancel')}\">${fmt.pct(m.cancel_rate)}</td>\n      <td class=\"num mono\">${fmt.dec(m.total_km, 0)}</td>\n      <td class=\"num mono\">${fmt.dec(m.trips_per_hour, 2)}</td>\n    `;\n    frag.appendChild(tr);\n  }\n  tbody.appendChild(frag);\n\n  // Gr\u00e1fico con TODOS los markets + altura din\u00e1mica\n  const allSorted = aggregateMarkets(rows).sort((a,b) => b.num_of_trips - a.num_of_trips);\n  const chartEl = document.getElementById('chart-market-trips');\n  const dynamicHeight = Math.min(Math.max(400, allSorted.length * 22 + 80), 3000);\n  // Ajustar altura del contenedor padre Y del div del chart\n  chartEl.style.height = dynamicHeight + 'px';\n  chartEl.style.minHeight = dynamicHeight + 'px';\n\n  safePlot('chart-market-trips', [{\n    type: 'bar', orientation: 'h',\n    x: allSorted.map(m => m.num_of_trips).reverse(),\n    y: allSorted.map(m => m.market_name).reverse(),\n    marker: { color: PALETTE[0] },\n    hovertemplate: '<b>%{y}</b><br>%{x:,} trips<extra></extra>',\n  }], {\n    ...PLOTLY_LAYOUT,\n    margin: { l: 200, r: 24, t: 10, b: 44 },\n    height: dynamicHeight,\n    yaxis: { ...PLOTLY_LAYOUT.yaxis, automargin: true },\n  });\n\n  updateSortIndicators('market');\n}\n\n// Render: Evoluci\u00f3n \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderEvolucion() {\n  const rows = filterRows();\n  const metric = state.evolMetric;\n  const group = state.evolGroup;\n\n  const acc = new Map();\n  for (const r of rows) {\n    if (!r.datestr) continue;\n    const day = r.datestr;\n    const g = group === 'none' ? '__total__' : (r[group] || '(vac\u00edo)');\n    const k = `${day}||${g}`;\n    if (!acc.has(k)) acc.set(k, { day, group: g, agg: zeroAgg(), drivers: new Set() });\n    const o = acc.get(k);\n    sumInto(o.agg, r);\n    if (r.driver_uuid) o.drivers.add(r.driver_uuid);\n  }\n  function computeValue(o) {\n    if (metric === 'riders') return o.drivers.size;\n    if (metric === 'trips_per_hour') return o.agg.online_hours > 0 ? o.agg.num_of_trips / o.agg.online_hours : 0;\n    if (metric === 'cancel_rate') {\n      return o.agg.accept_trips > 0 ? (o.agg.cancel_trips / o.agg.accept_trips) * 100 : 0;\n    }\n    if (metric === 'accept_rate') {\n      const off = o.agg.accept_trips + o.agg.reject_trips;\n      return off > 0 ? (o.agg.accept_trips / off) * 100 : 0;\n    }\n    return o.agg[metric] || 0;\n  }\n\n  const points = Array.from(acc.values()).map(o => ({ day: o.day, group: o.group, value: computeValue(o) }));\n  const groups = Array.from(new Set(points.map(p => p.group))).sort();\n  const allDays = Array.from(new Set(points.map(p => p.day))).sort();\n\n  const colorMap = {};\n  groups.forEach((g, i) => { colorMap[g] = PALETTE[i % PALETTE.length]; });\n\n  const traces = groups.map(g => {\n    const pMap = new Map(points.filter(p => p.group === g).map(p => [p.day, p.value]));\n    const color = colorMap[g];\n    return {\n      x: allDays,\n      y: allDays.map(d => pMap.get(d) ?? 0),\n      type: 'scatter',\n      mode: 'lines+markers',\n      name: g === '__total__' ? 'Total' : g,\n      line: { color, width: 2.5 },\n      marker: { size: 6, color },\n      // Fijar color expl\u00edcitamente evita el cambio al hover\n      hoverlabel: { bgcolor: '#ffffff', bordercolor: color,\n                    font: { family: 'JetBrains Mono, monospace', color: '#15171a', size: 11 } },\n      hovertemplate: '<b>%{x}</b><br>%{y:,.2f}<extra>' + (g === '__total__' ? 'Total' : g) + '</extra>',\n    };\n  });\n\n  const isPct = metric === 'cancel_rate' || metric === 'accept_rate';\n  const layout = {\n    ...PLOTLY_LAYOUT,\n    margin: { l: 60, r: 20, t: 10, b: 60 },\n    showlegend: group !== 'none',\n    legend: { ...PLOTLY_LAYOUT.legend, orientation: 'h', y: -0.12 },\n    yaxis: { ...PLOTLY_LAYOUT.yaxis, ticksuffix: isPct ? '%' : '' },\n    hovermode: 'closest',\n  };\n  safePlot('chart-evolucion', traces, layout);\n}\n\n// Render: Raw (datos en bruto) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// Definir columnas raw a mostrar. Solo incluye las que existen en ROWS.\nconst RAW_COLUMN_SPEC = [\n  { key: 'datestr', label: 'Fecha', type: 'date' },\n  { key: 'driver_name', label: 'Rider', type: 'str' },\n  { key: 'driver_email', label: 'Email', type: 'str' },\n  { key: 'driver_number', label: 'Tel\u00e9fono', type: 'str' },\n  { key: 'market_name', label: 'Market', type: 'str' },\n  { key: 'form_factor', label: 'Form factor', type: 'str' },\n  { key: 'city_name', label: 'Ciudad', type: 'str' },\n  { key: 'weekstr', label: 'Semana', type: 'date' },\n  { key: 'online_hours', label: 'H online', type: 'num', d: 2 },\n  { key: 'active_hours', label: 'H activas', type: 'num', d: 2 },\n  { key: 'open_hours', label: 'H disponible', type: 'num', d: 2 },\n  { key: 'enroute_p2_hours', label: 'H al viaje (P2)', type: 'num', d: 2 },\n  { key: 'ontrip_p3_hours', label: 'H de camino (P3)', type: 'num', d: 2 },\n  { key: 'unavailable_hours', label: 'H no disp.', type: 'num', d: 2 },\n  { key: 'num_of_trips', label: 'Trips', type: 'num', d: 0 },\n  { key: 'single_trips_total', label: 'Single trips', type: 'num', d: 0 },\n  { key: 'accept_trips', label: 'Aceptados', type: 'num', d: 0 },\n  { key: 'reject_trips', label: 'Rechazos', type: 'num', d: 0 },\n  { key: 'cancel_trips', label: 'Cancel.', type: 'num', d: 0 },\n  { key: 'cancel_not_at_fault_trips', label: 'Cancel. no fault', type: 'num', d: 0 },\n  { key: 'late_p2_trips', label: 'Late P2', type: 'num', d: 0 },\n  { key: 'late_p3_trips', label: 'Late P3', type: 'num', d: 0 },\n  { key: 'p2_km', label: 'Km P2', type: 'num', d: 1 },\n  { key: 'p2_min', label: 'Min P2', type: 'num', d: 1 },\n  { key: 'p3_km', label: 'Km P3', type: 'num', d: 1 },\n  { key: 'p3_min', label: 'Min P3', type: 'num', d: 1 },\n  { key: 'total_km', label: 'Km total', type: 'num', d: 1 },\n  { key: 'total_min', label: 'Min total', type: 'num', d: 1 },\n  { key: 'driver_uuid', label: 'UUID', type: 'str' },\n];\n\nfunction getRawColumns() {\n  // Solo conservar columnas que realmente existen en ROWS\n  if (!ROWS.length) return RAW_COLUMN_SPEC;\n  const availableKeys = new Set(Object.keys(ROWS[0]));\n  return RAW_COLUMN_SPEC.filter(c => availableKeys.has(c.key));\n}\n\nfunction buildRawTableHead() {\n  const cols = getRawColumns();\n  const tr = document.createElement('tr');\n  for (const c of cols) {\n    const th = document.createElement('th');\n    th.textContent = c.label;\n    th.dataset.sort = c.key;\n    if (c.type === 'num') th.classList.add('num');\n    th.addEventListener('click', () => toggleSort('raw', c.key));\n    tr.appendChild(th);\n  }\n  const thead = document.getElementById('thead-raw');\n  thead.innerHTML = '';\n  thead.appendChild(tr);\n}\n\nfunction renderRawTable() {\n  const rows = filterRows();\n  const cols = getRawColumns();\n\n  let filtered = rows;\n  if (state.rawSearch) {\n    const q = state.rawSearch;\n    filtered = rows.filter(r => {\n      for (const c of cols) {\n        if (c.type !== 'str') continue;\n        const v = r[c.key];\n        if (v && String(v).toLowerCase().includes(q)) return true;\n      }\n      return false;\n    });\n  }\n\n  const { col, dir } = state.rawSort;\n  const mult = dir === 'asc' ? 1 : -1;\n  const colSpec = cols.find(c => c.key === col);\n  filtered = [...filtered].sort((a, b) => {\n    const va = a[col], vb = b[col];\n    if (va == null && vb == null) return 0;\n    if (va == null) return 1;\n    if (vb == null) return -1;\n    if (colSpec && colSpec.type === 'num') return mult * ((+va || 0) - (+vb || 0));\n    return mult * String(va).localeCompare(String(vb), 'es');\n  });\n\n  state.currentRawRows = filtered;\n\n  const MAX = 1000;\n  const show = filtered.slice(0, MAX);\n  document.getElementById('meta-raw').textContent =\n    `${fmt.int(filtered.length)} filas de ${fmt.int(rows.length)}` +\n    (filtered.length > MAX ? ` \u00b7 mostrando primeras ${MAX}` : '');\n  document.getElementById('tab-count-raw').textContent = `(${fmt.int(rows.length)})`;\n\n  const tbody = document.querySelector('#table-raw tbody');\n  tbody.innerHTML = '';\n  const frag = document.createDocumentFragment();\n  for (const r of show) {\n    const tr = document.createElement('tr');\n    for (const c of cols) {\n      const td = document.createElement('td');\n      const v = r[c.key];\n      if (c.type === 'num') {\n        td.classList.add('num', 'mono');\n        td.textContent = v == null ? '\u2014' : fmt.dec(v, c.d || 0);\n      } else if (c.type === 'date') {\n        td.classList.add('mono');\n        td.textContent = v ? fmt.date(v) : '\u2014';\n      } else {\n        td.textContent = v == null ? '' : String(v);\n        if (c.key === 'driver_name' || c.key === 'market_name') td.classList.add('name');\n        if (c.key === 'driver_uuid') { td.classList.add('mono'); td.style.fontSize = '10px'; }\n      }\n      tr.appendChild(td);\n    }\n    frag.appendChild(tr);\n  }\n  tbody.appendChild(frag);\n  updateSortIndicators('raw');\n}\n\nfunction exportRawExcel() {\n  if (typeof XLSX === 'undefined') { alert('Librer\u00eda de Excel no disponible'); return; }\n  const data = state.currentRawRows;\n  if (!data.length) { alert('No hay datos para exportar'); return; }\n  const cols = getRawColumns();\n  const sheetData = data.map(r => {\n    const o = {};\n    for (const c of cols) {\n      let v = r[c.key];\n      if (v == null) v = '';\n      else if (c.type === 'num' && typeof v === 'number') v = Number(v.toFixed(c.d != null ? c.d : 2));\n      o[c.label] = v;\n    }\n    return o;\n  });\n  const ws = XLSX.utils.json_to_sheet(sheetData, { header: cols.map(c => c.label) });\n  ws['!cols'] = cols.map(c => ({ wch: Math.max(c.label.length + 2, 12) }));\n  const wb = XLSX.utils.book_new();\n  XLSX.utils.book_append_sheet(wb, ws, 'Raw');\n  const n = new Date();\n  const fname = `raw_${n.getFullYear()}${String(n.getMonth()+1).padStart(2,'0')}${String(n.getDate()).padStart(2,'0')}_${String(n.getHours()).padStart(2,'0')}${String(n.getMinutes()).padStart(2,'0')}.xlsx`;\n  XLSX.writeFile(wb, fname);\n}\n\n// Drawer \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction openRiderDrawer(rider) {\n  document.getElementById('drawer-name').textContent = rider.driver_name;\n  const metaParts = [rider.form_factor, rider.driver_email].filter(Boolean);\n  document.getElementById('drawer-meta').textContent = metaParts.join(' \u00b7 ');\n\n  document.getElementById('drawer-body').innerHTML = `\n    <div class=\"drawer-donut\"><div id=\"drawer-donut-chart\" style=\"height: 240px;\"></div></div>\n\n    <div class=\"drawer-stats\">\n      <div class=\"drawer-stat\">\n        <div class=\"label\">Horas conectado</div>\n        <div class=\"value\">${fmt.dec(rider.online_hours, 2)}<span class=\"unit\">h</span></div>\n        <div class=\"sub\">${fmt.int(rider.days_active)} d\u00edas activos</div>\n      </div>\n      <div class=\"drawer-stat\">\n        <div class=\"label\">Viajes hechos</div>\n        <div class=\"value\">${fmt.int(rider.num_of_trips)}</div>\n        <div class=\"sub\">${fmt.int(rider.accept_trips)} aceptados</div>\n      </div>\n      <div class=\"drawer-stat\">\n        <div class=\"label\">TPH</div>\n        <div class=\"value\">${fmt.dec(rider.trips_per_hour, 2)}</div>\n        <div class=\"sub\">viajes por hora online</div>\n      </div>\n      <div class=\"drawer-stat\">\n        <div class=\"label\">% Aceptaci\u00f3n</div>\n        <div class=\"value\">${fmt.pct(rider.accept_rate)}</div>\n        <div class=\"sub\">de ofertas recibidas</div>\n      </div>\n      <div class=\"drawer-stat\">\n        <div class=\"label\">% Cancelaci\u00f3n</div>\n        <div class=\"value\">${fmt.pct(rider.cancel_rate)}</div>\n        <div class=\"sub\">${fmt.int(rider.cancel_trips)} / ${fmt.int(rider.accept_trips + rider.cancel_trips)}</div>\n      </div>\n      <div class=\"drawer-stat\">\n        <div class=\"label\">Km totales</div>\n        <div class=\"value\">${fmt.dec(rider.total_km, 1)}<span class=\"unit\">km</span></div>\n        <div class=\"sub\">${fmt.dec(rider.p3_km, 1)} en P3</div>\n      </div>\n    </div>\n\n    <div class=\"drawer-section-title\">Desglose completo</div>\n    <div class=\"drawer-list\">\n      <div class=\"row\"><span class=\"k\">Primera fecha</span><span class=\"v\">${fmt.date(rider.first_date)}</span></div>\n      <div class=\"row\"><span class=\"k\">\u00daltima fecha</span><span class=\"v\">${fmt.date(rider.last_date)}</span></div>\n      <div class=\"row\"><span class=\"k\">Horas disponible</span><span class=\"v\">${fmt.dec(rider.open_hours, 2)} h</span></div>\n      <div class=\"row\"><span class=\"k\">Horas al viaje (P2)</span><span class=\"v\">${fmt.dec(rider.enroute_p2_hours, 2)} h</span></div>\n      <div class=\"row\"><span class=\"k\">Horas de camino (P3)</span><span class=\"v\">${fmt.dec(rider.ontrip_p3_hours, 2)} h</span></div>\n      <div class=\"row\"><span class=\"k\">Horas activas</span><span class=\"v\">${fmt.dec(rider.active_hours, 2)} h</span></div>\n      <div class=\"row\"><span class=\"k\">Rechazos</span><span class=\"v\">${fmt.int(rider.reject_trips)}</span></div>\n      <div class=\"row\"><span class=\"k\">Cancel. no fault</span><span class=\"v\">${fmt.int(rider.cancel_not_at_fault_trips)}</span></div>\n      <div class=\"row\"><span class=\"k\">Late P2 + P3</span><span class=\"v\">${fmt.int(rider.late_p2_trips + rider.late_p3_trips)}</span></div>\n      <div class=\"row\"><span class=\"k\">Km P2</span><span class=\"v\">${fmt.dec(rider.p2_km, 1)} km</span></div>\n      <div class=\"row\"><span class=\"k\">Markets (${rider.markets})</span><span class=\"v\">${escapeHtml(rider.markets_list)}</span></div>\n      <div class=\"row\"><span class=\"k\">Tel\u00e9fono</span><span class=\"v\">${escapeHtml(rider.driver_number || '\u2014')}</span></div>\n      <div class=\"row\"><span class=\"k\">UUID</span><span class=\"v\" style=\"font-size:10px\">${escapeHtml(rider.driver_uuid)}</span></div>\n    </div>\n  `;\n\n  const donutValues = [rider.open_hours, rider.enroute_p2_hours, rider.ontrip_p3_hours];\n  if (typeof Plotly !== 'undefined' && donutValues.some(v => v > 0)) {\n    Plotly.newPlot('drawer-donut-chart', [{\n      type: 'pie', hole: 0.58,\n      labels: ['Disponible', 'Al viaje', 'De camino'],\n      values: donutValues,\n      marker: { colors: [PALETTE[1], PALETTE[3], PALETTE[0]] },\n      textinfo: 'none',\n      sort: false,\n      hovertemplate: '<b>%{label}</b><br>%{value:.2f} h (%{percent})<extra></extra>',\n    }], {\n      ...PLOTLY_LAYOUT,\n      margin: { l: 0, r: 0, t: 0, b: 28 },\n      annotations: [{\n        text: `<b>${fmt.dec(rider.online_hours, 2)}</b><br><span style=\"font-size:10px;color:#86878a\">Horas online</span>`,\n        showarrow: false, font: { family: 'Fraunces', size: 20, color: '#15171a' },\n      }],\n      showlegend: true,\n      legend: { orientation: 'h', y: 0, x: 0.5, xanchor: 'center', font: { size: 10 } },\n    }, { responsive: true, displayModeBar: false });\n  }\n\n  document.getElementById('drawer').classList.add('open');\n  document.getElementById('drawer-backdrop').classList.add('open');\n  document.body.style.overflow = 'hidden';\n}\n\nfunction closeDrawer() {\n  document.getElementById('drawer').classList.remove('open');\n  document.getElementById('drawer-backdrop').classList.remove('open');\n  document.body.style.overflow = '';\n}\n\n// Tabs / sort / render-all \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction switchTab(name) {\n  state.activeTab = name;\n  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === name));\n  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));\n  setTimeout(resizePlots, 60);\n}\n\nfunction resizePlots() {\n  if (typeof Plotly === 'undefined') return;\n  document.querySelectorAll('.chart-area').forEach(el => {\n    if (el.data) { try { Plotly.Plots.resize(el); } catch (e) {} }\n  });\n}\n\nfunction toggleSort(which, col) {\n  const key = which + 'Sort';\n  if (state[key].col === col) state[key].dir = state[key].dir === 'asc' ? 'desc' : 'asc';\n  else { state[key].col = col; state[key].dir = 'desc'; }\n  if (which === 'rider') renderRiderTable();\n  else if (which === 'market') renderMarketTable();\n  else if (which === 'city') renderCityTable();\n  else if (which === 'raw') renderRawTable();\n}\n\nfunction updateSortIndicators(which) {\n  const { col, dir } = state[which + 'Sort'];\n  const sel = which === 'raw' ? '#thead-raw th[data-sort]' : `#table-${which} th[data-sort]`;\n  document.querySelectorAll(sel).forEach(th => {\n    th.classList.remove('sorted-asc', 'sorted-desc');\n    if (th.dataset.sort === col) th.classList.add(dir === 'asc' ? 'sorted-asc' : 'sorted-desc');\n  });\n}\n\nfunction renderAll() {\n  const rows = filterRows();\n  renderResumen(rows);\n  renderRiderTable();\n  renderCityTable();\n  renderMarketTable();\n  renderEvolucion();\n  renderRawTable();\n}\n\ndocument.addEventListener('DOMContentLoaded', init);\n</script>\n</body>\n</html>\n"
-
-    html = (
-        TEMPLATE_HTML
-        .replace('__DATA_B64__', data_b64)
-        .replace('__META_B64__', meta_b64)
+    g = (
+        conn.group_by(['courier_uuid', 'fecha_real']).agg([
+            pl.col('dur_h').sum().alias('horas_total'),
+            (pl.col('dur_h') * pl.col('es_madrugada').cast(pl.Float64)).sum().alias('horas_madrugada'),
+        ])
     )
-    
-    html_path = os.path.join(OUTPUT_DIR, HTML_FILENAME)
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write(html)
-    print(f"Dashboard HTML guardado localmente en: {html_path}")
-    print("¡Proceso completado con éxito!")
+    g = g.with_columns(
+        pl.when(pl.col('horas_total') > 0)
+          .then(pl.col('horas_madrugada') / pl.col('horas_total'))
+          .otherwise(0.0).alias('frac_horas')
+    )
+    g = g.rename({'fecha_real': 'dia'})
+    return g.select(['courier_uuid', 'dia', 'frac_horas', 'horas_total', 'horas_madrugada'])
 
+
+def apply_adjustment(silver, rta, conn):
+    """
+    Modelo PROPORCIONAL sobre el SILVER (regla 02:00).
+
+    El SILVER manda en TODOS los totales (num_of_trips, accept, cancel, horas)
+    porque ya viene correcto de Uber. Lo único que hacemos es MOVER la parte
+    de madrugada (< 02:00) de cada día al día anterior.
+
+    La fracción de madrugada se calcula con timestamps reales:
+      - PEDIDOS (viajes, accept, cancel) → fracción de RTA (frac_rta)
+      - HORAS (online_hours, p2, p3, etc.) → fracción de Connections (frac_horas)
+
+    Para cada (rider, día D):
+      mover_pedidos = total_silver(D) * frac_rta(D)   → de D a D-1
+      mover_horas   = horas_silver(D) * frac_horas(D) → de D a D-1
+    Si un día no tiene RTA/Connections, su fracción es 0 → no se mueve nada.
+
+    Pedidos/viajes: enteros (round). Horas: decimal.
+    % aceptación/cancelación: se recalculan con los totales ya movidos,
+    usando las fórmulas oficiales del silver:
+      % Aceptación  = accept / (accept + reject)
+      % Cancelación = cancel / accept
+    """
+    silver = silver.with_columns(pl.col('datestr').dt.date().alias('_dia'))
+
+    # --- Unir fracciones de RTA y Connections al silver por (uuid, día) ---
+    s = silver
+    if rta is not None and len(rta) > 0:
+        s = s.join(rta.select(['courier_uuid', 'dia', 'frac_rta']),
+                   left_on=['driver_uuid', '_dia'], right_on=['courier_uuid', 'dia'], how='left')
+    else:
+        s = s.with_columns(pl.lit(0.0).alias('frac_rta'))
+    if conn is not None and len(conn) > 0:
+        s = s.join(conn.select(['courier_uuid', 'dia', 'frac_horas']),
+                   left_on=['driver_uuid', '_dia'], right_on=['courier_uuid', 'dia'], how='left')
+    else:
+        s = s.with_columns(pl.lit(0.0).alias('frac_horas'))
+
+    s = s.with_columns([
+        pl.col('frac_rta').fill_null(0.0),
+        pl.col('frac_horas').fill_null(0.0),
+    ])
+
+    # Columnas de pedidos que se mueven con frac_rta
+    PEDIDO_COLS = [c for c in ['num_of_trips', 'single_trips_total', 'accept_trips',
+                               'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
+                               'late_p2_trips', 'late_p3_trips'] if c in s.columns]
+    # Columnas de horas/distancia que se mueven con frac_horas
+    HORA_COLS = [c for c in ['online_hours', 'active_hours', 'open_hours',
+                             'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours',
+                             'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min'] if c in s.columns]
+
+    # --- Cantidad que se mueve al día anterior ---
+    mv_exprs = []
+    for c in PEDIDO_COLS:
+        mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_rta')).round(0).alias('mv_' + c))
+    for c in HORA_COLS:
+        mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_horas')).alias('mv_' + c))
+    s = s.with_columns(mv_exprs)
+
+    # --- Construir los movimientos (lo que entra en D-1) ---
+    move_cols = ['mv_' + c for c in PEDIDO_COLS + HORA_COLS]
+    movidos = s.select(
+        ['driver_uuid'] +
+        [(pl.col('_dia') - pl.duration(days=1)).alias('_dia')] +
+        [pl.col('mv_' + c).alias('in_' + c) for c in PEDIDO_COLS + HORA_COLS]
+    )
+    movidos = movidos.group_by(['driver_uuid', '_dia']).agg(
+        [pl.col('in_' + c).sum() for c in PEDIDO_COLS + HORA_COLS]
+    )
+
+    # --- Restar de cada día lo que sale, sumar lo que entra ---
+    # Primero restamos
+    s = s.with_columns(
+        [(pl.col(c).fill_null(0) - pl.col('mv_' + c)).alias(c) for c in PEDIDO_COLS + HORA_COLS]
+    )
+    # Unimos lo que entra del día siguiente
+    s = s.join(movidos, on=['driver_uuid', '_dia'], how='left')
+    s = s.with_columns(
+        [(pl.col(c) + pl.col('in_' + c).fill_null(0)).alias(c) for c in PEDIDO_COLS + HORA_COLS]
+    )
+
+    # --- Recalcular métricas derivadas con los totales ya movidos ---
+    s = s.with_columns([
+        pl.when(pl.col('online_hours') > 0)
+          .then(pl.col('num_of_trips') / pl.col('online_hours'))
+          .otherwise(0.0).alias('tph_adj'),
+    ])
+    if 'accept_trips' in s.columns and 'reject_trips' in s.columns:
+        s = s.with_columns(
+            pl.when((pl.col('accept_trips') + pl.col('reject_trips')) > 0)
+              .then(pl.col('accept_trips') / (pl.col('accept_trips') + pl.col('reject_trips')) * 100)
+              .otherwise(0.0).alias('pct_aceptacion')
+        )
+    if 'cancel_trips' in s.columns and 'accept_trips' in s.columns:
+        s = s.with_columns(
+            pl.when(pl.col('accept_trips') > 0)
+              .then(pl.col('cancel_trips') / pl.col('accept_trips') * 100)
+              .otherwise(0.0).alias('pct_cancelacion')
+        )
+
+    # Marcar si la fila tuvo movimiento (para inspección)
+    s = s.with_columns([
+        ((pl.col('frac_rta') > 0) | (pl.col('frac_horas') > 0) |
+         pl.col('in_num_of_trips').is_not_null()).alias('ajustado_connections'),
+        pl.col('frac_rta').alias('_frac_rta_dbg'),
+        pl.col('frac_horas').alias('_frac_horas_dbg'),
+    ])
+
+    # Limpiar auxiliares
+    aux = ['frac_rta', 'frac_horas'] + ['mv_' + c for c in PEDIDO_COLS + HORA_COLS] + \
+          ['in_' + c for c in PEDIDO_COLS + HORA_COLS]
+    s = s.drop([c for c in aux if c in s.columns])
+    return s
+
+
+# =============================================================================
+# 5. MAIN
+# =============================================================================
+
+def main():
+    # --- Bronze ---
+    bronze_daily = ingest_bronze_daily()
+    if bronze_daily is None:
+        print("\n✗ No hay datos de COURIER_DAILY. Abortando.")
+        return
+    bronze_conn = ingest_bronze_connections()
+    bronze_rta  = ingest_bronze_rta()
+
+    # --- Silver ---
+    silver = build_silver(bronze_daily)
+
+    # --- Reconstrucción de cada fuente por día lógico ---
+    recon_conn = None
+    if bronze_conn is not None and len(bronze_conn) > 0:
+        recon_conn = reconstruct_connections(bronze_conn)
+        print(f"[conn] Reconstrucción: {len(recon_conn):,} combinaciones (rider, día)")
+
+    recon_rta = None
+    if bronze_rta is not None and len(bronze_rta) > 0:
+        recon_rta = reconstruct_rta(bronze_rta)
+        print(f"[rta] Reconstrucción: {len(recon_rta):,} combinaciones (rider, día)")
+
+    # --- Ajuste proporcional sobre el silver (regla 02:00) ---
+    if recon_conn is not None or recon_rta is not None:
+        final = apply_adjustment(silver, recon_rta, recon_conn)
+        n_mov = final.filter(pl.col('ajustado_connections')).height
+        print(f"[ajuste] Filas con movimiento de madrugada: {n_mov:,} / {len(final):,}")
+    else:
+        print("[ajuste] Sin Connections ni RTA — silver sin ajustar")
+        final = silver.with_columns([
+            (pl.col('num_of_trips') / pl.col('online_hours')).alias('tph_adj'),
+            pl.lit(False).alias('ajustado_connections'),
+            pl.lit(0.0).alias('_frac_rta_dbg'),
+            pl.lit(0.0).alias('_frac_horas_dbg'),
+        ]).drop('_dia')
+
+    # --- Quitar filas de días vacíos (0 viajes Y 0 horas) ---
+    antes = len(final)
+    final = final.filter(
+        ~((pl.col('num_of_trips').fill_null(0) == 0) &
+          (pl.col('online_hours').fill_null(0) == 0))
+    )
+    quitadas = antes - len(final)
+    if quitadas > 0:
+        print(f"[limpieza] Filas vacías eliminadas (0 viajes y 0 horas): {quitadas}")
+
+    # --- Salidas ---
+    final.write_parquet(SILVER_PARQUET, compression='zstd')
+    print(f"\n✓ Parquet final: {SILVER_PARQUET} ({len(final):,} filas)")
+
+    # NOTA: el pipeline NO genera dashboard.html. El dashboard de producción
+    # es la app React, que lee el parquet directamente. No tocamos ese archivo.
+
+    # --- Chequeo de integridad: una sola fila por (rider, día) ---
+    dups = (final.with_columns(pl.col('datestr').dt.date().alias('_d'))
+                 .group_by(['driver_uuid', '_d']).agg(pl.len().alias('n'))
+                 .filter(pl.col('n') > 1))
+    if len(dups) > 0:
+        print(f"⚠ ADVERTENCIA: hay {len(dups)} duplicados (rider, día)")
+    else:
+        print("✓ Integridad OK: una fila por rider y día")
+
+    print("\n¡Proceso completado!")
+
+
+if __name__ == '__main__':
+    main()
