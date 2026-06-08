@@ -69,7 +69,7 @@ jobs:
 
       # 3. EJECUTAR PIPELINE (bronce viejo + CSVs nuevos → actualiza)
       - name: Ejecutar pipeline
-        run: python pipeline_v5_silver_movido.py
+        run: python proceso_completo_uber.py
 
       # 4. SUBIR BRONZE ACTUALIZADO + el parquet de producción
       - name: Subir bronce actualizado a Drive
