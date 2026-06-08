@@ -3,7 +3,7 @@ name: Pipeline Producción (riders)
 # Corre cada hora (igual que el original) y también manualmente.
 on:
   schedule:
-    - cron: '25 * * * *'
+    - cron: '13 * * * *'
   workflow_dispatch:
 
 jobs:
