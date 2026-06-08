@@ -46,7 +46,6 @@ BRONZE_RTA_PARQUET   = os.path.join(OUTPUT_DIR, 'bronze_rta' + BRONZE_SUFFIX + '
 
 # Salidas finales
 SILVER_PARQUET = os.path.join(OUTPUT_DIR, SILVER_NAME + '.parquet')
-SILVER_CSV     = os.path.join(OUTPUT_DIR, SILVER_NAME + '.csv')
 
 # Ventana de reproceso: cuántas semanas hacia atrás recalcular silver+ajuste.
 # 3 semanas cubre la regla de 2 semanas del dashboard + margen.
@@ -602,7 +601,7 @@ def main():
     if quitadas > 0:
         print(f"[limpieza] Filas vacías eliminadas (0 viajes y 0 horas): {quitadas}")
 
-    # --- Salidas ---
+    # --- Salida: SOLO el parquet (lo que lee la app). Sin CSV ni dashboard. ---
     final.write_parquet(SILVER_PARQUET, compression='zstd')
     print(f"\n✓ Parquet final: {SILVER_PARQUET} ({len(final):,} filas)")
 
