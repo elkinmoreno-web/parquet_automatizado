@@ -367,21 +367,81 @@ def reconstruct_rta(bronze_rta):
 # =============================================================================
 
 def build_silver(bronze_daily):
-    # Dedup por (driver_uuid, datestr). Criterio:
-    #   1) file_date más reciente (la última versión del dato)
-    #   2) si empatan en file_date (mismo timestamp en el nombre de dos archivos),
-    #      quedarse con la de mayor num_of_trips (la versión más completa)
-    #   3) garantía final: una sola fila por (uuid, día) con unique()
-    silver = (
-        bronze_daily
-        .filter(pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null())
-        .sort(
+    """
+    Construye el silver con UNA fila por (driver_uuid, día), pero SUMANDO los
+    turnos partidos / zonas distintas del mismo día (p. ej. CARABANCHEL + CENTRO).
+
+    Dos pasos:
+      1) Dedup de VERSIONES: el mismo (uuid, día, ciudad) puede venir repetido en
+         varios CSV (re-exportaciones). Nos quedamos con la fila del file_date más
+         reciente (y, si empatan, la de más num_of_trips).
+      2) SUMA por (uuid, día): se suman horas, viajes, km y min de todas las zonas.
+         Las métricas promedio/derivadas (_avg) se RECALCULAN sobre los totales,
+         no se suman.
+    """
+    base = bronze_daily.filter(
+        pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null()
+    )
+
+    # --- Paso 1: quedarnos con la versión más reciente de cada (uuid, día, ciudad) ---
+    # city_id distingue zonas; si no existe, usamos city_name; si tampoco, cadena vacía.
+    zona_col = 'city_id' if 'city_id' in base.columns else (
+        'city_name' if 'city_name' in base.columns else None)
+    subset_version = ['driver_uuid', 'datestr'] + ([zona_col] if zona_col else [])
+    base = (
+        base.sort(
             ['driver_uuid', 'datestr', 'file_date', 'num_of_trips'],
             descending=[False, False, True, True],
             nulls_last=True,
         )
-        .unique(subset=['driver_uuid', 'datestr'], keep='first', maintain_order=True)
+        .unique(subset=subset_version, keep='first', maintain_order=True)
     )
+
+    # --- Paso 2: sumar todas las zonas del mismo (uuid, día) ---
+    # Columnas que se SUMAN (cantidades absolutas)
+    SUM_COLS = [c for c in [
+        'online_hours', 'active_hours', 'open_hours',
+        'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours',
+        'num_of_trips', 'single_trips_total', 'late_p2_trips', 'late_p3_trips',
+        'accept_trips', 'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
+        'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min',
+    ] if c in base.columns]
+
+    # Columnas de texto/identidad: tomamos la primera (la de la zona con más viajes,
+    # porque venimos ordenados por num_of_trips desc dentro del día)
+    FIRST_COLS = [c for c in [
+        'weekstr', 'driver_name', 'driver_number', 'driver_email',
+        'fleet_name', 'city_id', 'city_name', 'market_name', 'form_factor',
+    ] if c in base.columns]
+
+    aggs = [pl.col(c).sum().alias(c) for c in SUM_COLS]
+    aggs += [pl.col(c).first().alias(c) for c in FIRST_COLS]
+
+    silver = (
+        base.sort(['driver_uuid', 'datestr', 'num_of_trips'],
+                  descending=[False, False, True], nulls_last=True)
+        .group_by(['driver_uuid', 'datestr'], maintain_order=True)
+        .agg(aggs)
+    )
+
+    # --- Recalcular promedios (_avg) sobre los totales sumados ---
+    def avg_expr(num, den, name):
+        if num in silver.columns and den in silver.columns:
+            return (pl.when(pl.col(den) > 0)
+                      .then(pl.col(num) / pl.col(den))
+                      .otherwise(0.0).alias(name))
+        return None
+    recalcs = [
+        avg_expr('p2_km', 'num_of_trips', 'p2_km_avg'),
+        avg_expr('p2_min', 'num_of_trips', 'p2_min_avg'),
+        avg_expr('p3_km', 'num_of_trips', 'p3_km_avg'),
+        avg_expr('p3_min', 'num_of_trips', 'p3_min_avg'),
+        avg_expr('total_km', 'num_of_trips', 'total_km_avg'),
+        avg_expr('total_min', 'num_of_trips', 'total_min_avg'),
+    ]
+    recalcs = [r for r in recalcs if r is not None]
+    if recalcs:
+        silver = silver.with_columns(recalcs)
 
     # Recorte a la ventana reciente para reprocesar rápido
     max_day = silver.select(pl.col('datestr').max()).item()
@@ -585,11 +645,15 @@ def main():
     else:
         print("[ajuste] Sin Connections ni RTA — silver sin ajustar")
         final = silver.with_columns([
-            (pl.col('num_of_trips') / pl.col('online_hours')).alias('tph_adj'),
+            pl.when(pl.col('online_hours') > 0)
+              .then(pl.col('num_of_trips') / pl.col('online_hours'))
+              .otherwise(0.0).alias('tph_adj'),
             pl.lit(False).alias('ajustado_connections'),
             pl.lit(0.0).alias('_frac_rta_dbg'),
             pl.lit(0.0).alias('_frac_horas_dbg'),
-        ]).drop('_dia')
+        ])
+        if '_dia' in final.columns:
+            final = final.drop('_dia')
 
     # --- Quitar filas de días vacíos (0 viajes Y 0 horas) ---
     antes = len(final)
