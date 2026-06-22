@@ -383,34 +383,20 @@ def build_silver(bronze_daily):
         pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null()
     )
 
-    # --- Paso 1: descartar snapshots intraday y duplicados ---
-    # Uber genera CSVs varias veces al día. Un CSV capturado a las 17:00 puede
-    # mostrar 2 viajes para un rider cuyo día terminará con 18. El CSV del día
-    # siguiente ya tiene el valor final (18). Si guardamos ambas en el bronze,
-    # la fila antigua (2 viajes) y la nueva (18 viajes) tienen distinto
-    # num_of_trips → el dedup por contenido los trata como turnos distintos y
-    # los SUMA, inflando el total.
-    #
-    # Solución: para cada (driver_uuid, datestr), conservar ÚNICAMENTE las filas
-    # del file_date más reciente que cubre ese par. Los turnos partidos (varias
-    # zonas el mismo día) siempre vienen juntos en el mismo CSV (mismo file_date)
-    # → ambas filas se conservan. El snapshot obsoleto (file_date anterior) queda
-    # descartado.
-    latest_fd = (
-        base.group_by(['driver_uuid', 'datestr'])
-            .agg(pl.col('file_date').max().alias('_latest_fd'))
-    )
+    # --- Paso 1: quitar FILAS DUPLICADAS EXACTAS entre archivos ---
+    # El mismo dato (uuid, día, mismas métricas) puede venir repetido en varios
+    # CSV (re-exportaciones). Quitamos duplicados exactos por el CONTENIDO de la
+    # fila, NO por (uuid,día), para no descartar turnos partidos / zonas distintas
+    # que sí deben sumarse. Las claves de contenido distinguen dos turnos reales
+    # (difieren en horas/viajes/zona) de una simple re-exportación idéntica.
+    dedup_keys = [c for c in [
+        'driver_uuid', 'datestr', 'city_id', 'city_name',
+        'num_of_trips', 'online_hours', 'accept_trips',
+    ] if c in base.columns]
+    # Nos quedamos con la versión de file_date más reciente de cada fila idéntica
     base = (
-        base.join(latest_fd, on=['driver_uuid', 'datestr'], how='inner')
-            .filter(pl.col('file_date') == pl.col('_latest_fd'))
-            .drop('_latest_fd')
-    )
-    # Dedup exacto residual (dos archivos distintos con el mismo contenido y
-    # file_date idéntico, o un re-procesado con distinto nombre de archivo).
-    base = base.unique(
-        subset=[c for c in ['driver_uuid', 'datestr', 'num_of_trips', 'online_hours', 'accept_trips']
-                if c in base.columns],
-        keep='first'
+        base.sort(['file_date'], descending=True, nulls_last=True)
+            .unique(subset=dedup_keys, keep='first', maintain_order=True)
     )
 
     # --- Paso 2: sumar todas las zonas del mismo (uuid, día) ---
@@ -527,9 +513,7 @@ def apply_adjustment(silver, rta, conn):
       mover_horas   = horas_silver(D) * frac_horas(D) → de D a D-1
     Si un día no tiene RTA/Connections, su fracción es 0 → no se mueve nada.
 
-    Pedidos principales (num_of_trips, accept_trips, single_trips_total): conteo exacto
-    de ACCEPTs de madrugada (rta_madrugada), acotado al total silver. Pedidos secundarios
-    (cancel, reject, late): proporcional con frac_rta. Horas: decimal.
+    Pedidos/viajes: enteros (round). Horas: decimal.
     % aceptación/cancelación: se recalculan con los totales ya movidos,
     usando las fórmulas oficiales del silver:
       % Aceptación  = accept / (accept + reject)
@@ -540,11 +524,10 @@ def apply_adjustment(silver, rta, conn):
     # --- Unir fracciones de RTA y Connections al silver por (uuid, día) ---
     s = silver
     if rta is not None and len(rta) > 0:
-        # Unimos frac_rta Y rta_madrugada (conteo exacto de ACCEPTs de madrugada)
         s = s.join(rta.select(['courier_uuid', 'dia', 'frac_rta', 'rta_madrugada']),
                    left_on=['driver_uuid', '_dia'], right_on=['courier_uuid', 'dia'], how='left')
     else:
-        s = s.with_columns([pl.lit(0.0).alias('frac_rta'), pl.lit(0).cast(pl.Int64).alias('rta_madrugada')])
+        s = s.with_columns([pl.lit(0.0).alias('frac_rta'), pl.lit(0).alias('rta_madrugada')])
     if conn is not None and len(conn) > 0:
         s = s.join(conn.select(['courier_uuid', 'dia', 'frac_horas']),
                    left_on=['driver_uuid', '_dia'], right_on=['courier_uuid', 'dia'], how='left')
@@ -553,38 +536,37 @@ def apply_adjustment(silver, rta, conn):
 
     s = s.with_columns([
         pl.col('frac_rta').fill_null(0.0),
-        pl.col('rta_madrugada').fill_null(0).cast(pl.Int64),
         pl.col('frac_horas').fill_null(0.0),
+        pl.col('rta_madrugada').fill_null(0),
     ])
 
-    # Columnas de pedidos principales: se mueve el conteo EXACTO de ACCEPTs de
-    # madrugada (rta_madrugada), acotado al total del silver del día.
-    # Esto evita la inflación del redondeo proporcional (ej. round(26 × 1/12) = 2
-    # cuando el conteo real de madrugada es solo 1).
-    EXACT_PEDIDO_COLS = [c for c in ['num_of_trips', 'single_trips_total', 'accept_trips']
-                         if c in s.columns]
-    # Columnas de pedidos secundarias (cancel, reject, late): sin timestamps
-    # individuales disponibles → proporcional con frac_rta (sin round).
-    PROP_PEDIDO_COLS = [c for c in ['reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
-                                    'late_p2_trips', 'late_p3_trips'] if c in s.columns]
-    PEDIDO_COLS = EXACT_PEDIDO_COLS + PROP_PEDIDO_COLS
+    # Columnas de pedidos que se mueven con frac_rta
+    PEDIDO_COLS = [c for c in ['num_of_trips', 'single_trips_total', 'accept_trips',
+                               'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
+                               'late_p2_trips', 'late_p3_trips'] if c in s.columns]
     # Columnas de horas/distancia que se mueven con frac_horas
     HORA_COLS = [c for c in ['online_hours', 'active_hours', 'open_hours',
                              'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours',
                              'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min'] if c in s.columns]
 
     # --- Cantidad que se mueve al día anterior ---
+    # PEDIDOS: movemos el CONTEO EXACTO de madrugada que dice RTA (rta_madrugada),
+    # NO una proporción del total redondeada (eso inflaba por redondeo: p.ej.
+    # round(26 * 1/12) = 2 cuando la madrugada real era 1 viaje).
+    # Acotamos a que no se mueva más que el propio total del día (min_horizontal).
     mv_exprs = []
-    for c in EXACT_PEDIDO_COLS:
-        # Conteo exacto de madrugada, acotado al total del día
-        mv_exprs.append(
-            pl.min_horizontal(
-                pl.col('rta_madrugada').cast(pl.Float64),
-                pl.col(c).fill_null(0)
-            ).alias('mv_' + c)
-        )
-    for c in PROP_PEDIDO_COLS:
-        mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_rta')).alias('mv_' + c))
+    for c in PEDIDO_COLS:
+        if c in ('num_of_trips', 'accept_trips', 'single_trips_total'):
+            # Mover el número entero de pedidos de madrugada, sin pasar del total del día
+            mv_exprs.append(
+                pl.min_horizontal(
+                    pl.col('rta_madrugada').fill_null(0).cast(pl.Float64),
+                    pl.col(c).fill_null(0),
+                ).alias('mv_' + c)
+            )
+        else:
+            # Resto de columnas de pedidos: proporción exacta
+            mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_rta')).round(0).alias('mv_' + c))
     for c in HORA_COLS:
         mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_horas')).alias('mv_' + c))
     s = s.with_columns(mv_exprs)
@@ -639,7 +621,7 @@ def apply_adjustment(silver, rta, conn):
     ])
 
     # Limpiar auxiliares
-    aux = ['frac_rta', 'rta_madrugada', 'frac_horas'] + ['mv_' + c for c in PEDIDO_COLS + HORA_COLS] + \
+    aux = ['frac_rta', 'frac_horas', 'rta_madrugada'] + ['mv_' + c for c in PEDIDO_COLS + HORA_COLS] + \
           ['in_' + c for c in PEDIDO_COLS + HORA_COLS]
     s = s.drop([c for c in aux if c in s.columns])
     return s
