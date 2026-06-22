@@ -3,7 +3,7 @@ name: Pipeline Producción (riders)
 # Corre cada 5 horas y también se puede disparar manualmente.
 on:
   schedule:
-    - cron: '0 */5 * * *'   # cada 5 horas
+    - cron: '7 */5 * * *'   # cada 5 horas
   workflow_dispatch:
 
 jobs:
