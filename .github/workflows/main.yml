@@ -1,9 +1,9 @@
-name: Pipeline Producción (riders)
+name: Pipeline Producción (riders) V0
 
-# Corre cada 5 horas y también se puede disparar manualmente.
+# Corre cada hora (igual que el original) y también manualmente.
 on:
   schedule:
-    - cron: '7 */5 * * *'   # cada 5 horas
+    - cron: '13 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -38,6 +38,25 @@ jobs:
             --include "bronze_*.parquet" \
             --transfers 8 --checkers 8 -v || echo "Sin bronce previo (primera corrida)"
 
+      # 2. BAJAR SOLO CSVs RECIENTES (paralelo + últimos 25 días)
+      - name: Descargar COURIER_DAILY (reciente)
+        run: |
+          rclone copy "gdrive:" COURIER_DAILY/ \
+            --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY \
+            --transfers 32 --checkers 32 --fast-list --max-age 25d -v
+
+      - name: Descargar CONNECTIONS (reciente)
+        run: |
+          rclone copy "gdrive:" CONNECTIONS/ \
+            --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 \
+            --transfers 32 --checkers 32 --fast-list --max-age 25d -v
+
+      - name: Descargar CANCELLATIONS_RTA (reciente)
+        run: |
+          rclone copy "gdrive:" CANCELLATIONS_RTA/ \
+            --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u \
+            --transfers 32 --checkers 32 --fast-list --max-age 25d -v
+
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
@@ -48,44 +67,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install polars pyarrow
 
-      # 2. CALCULAR AUTOMÁTICAMENTE cuántos días bajar.
-      #    Lee el bronce y detecta el último dato procesado. Si lleva 4 días sin
-      #    correr, baja 4 días (+margen). Si corrió hoy, baja 2. Primera vez: 30.
-      - name: Calcular ventana de descarga
-        id: ventana
-        run: |
-          VENTANA=$(python3 calcular_ventana.py)
-          echo "Ventana detectada: ${VENTANA} días"
-          echo "dias=${VENTANA}" >> "$GITHUB_OUTPUT"
-
-      # 3. BAJAR SOLO LOS CSVs QUE FALTAN (ventana dinámica)
-      - name: Descargar COURIER_DAILY
-        run: |
-          rclone copy "gdrive:" COURIER_DAILY/ \
-            --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY \
-            --transfers 32 --checkers 32 --fast-list \
-            --max-age "${{ steps.ventana.outputs.dias }}d" --ignore-existing
-
-      - name: Descargar CONNECTIONS
-        run: |
-          rclone copy "gdrive:" CONNECTIONS/ \
-            --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 \
-            --transfers 64 --checkers 64 --fast-list \
-            --max-age "${{ steps.ventana.outputs.dias }}d" \
-            --ignore-existing --stats 30s
-
-      - name: Descargar CANCELLATIONS_RTA
-        run: |
-          # RTA genera ~288 archivos/día. El bronce ya guarda el histórico,
-          # así que la ventana dinámica baja solo lo que falta desde la última
-          # corrida (sin importar cuántos días lleve parado).
-          rclone copy "gdrive:" CANCELLATIONS_RTA/ \
-            --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u \
-            --transfers 64 --checkers 64 --fast-list \
-            --max-age "${{ steps.ventana.outputs.dias }}d" \
-            --ignore-existing --stats 30s
-
-      # 4. EJECUTAR PIPELINE (bronce viejo + CSVs nuevos → actualiza)
+      # 3. EJECUTAR PIPELINE (bronce viejo + CSVs nuevos → actualiza)
       - name: Ejecutar pipeline
         run: python proceso_completo_uber.py
 
@@ -100,4 +82,6 @@ jobs:
       - name: Subir resultado a Drive
         run: |
           rclone copy datos_salida/rides_silver.parquet "gdrive:" \
+            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
+          rclone copy datos_salida/rides_silver.csv "gdrive:" \
             --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
