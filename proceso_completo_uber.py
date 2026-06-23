@@ -383,20 +383,20 @@ def build_silver(bronze_daily):
         pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null()
     )
 
-    # --- Paso 1: quitar FILAS DUPLICADAS EXACTAS entre archivos ---
-    # El mismo dato (uuid, día, mismas métricas) puede venir repetido en varios
-    # CSV (re-exportaciones). Quitamos duplicados exactos por el CONTENIDO de la
-    # fila, NO por (uuid,día), para no descartar turnos partidos / zonas distintas
-    # que sí deben sumarse. Las claves de contenido distinguen dos turnos reales
-    # (difieren en horas/viajes/zona) de una simple re-exportación idéntica.
-    dedup_keys = [c for c in [
-        'driver_uuid', 'datestr', 'city_id', 'city_name',
-        'num_of_trips', 'online_hours', 'accept_trips',
-    ] if c in base.columns]
-    # Nos quedamos con la versión de file_date más reciente de cada fila idéntica
+    # --- Paso 1: quedarnos con UNA versión por (uuid, día, ZONA) ---
+    # Una re-exportación = misma (uuid, día, zona) con métricas que pueden variar
+    # ligeramente entre exportaciones (decimales de horas, etc.). NO hay que
+    # sumarlas: son el mismo turno reexportado. Nos quedamos con la más reciente
+    # (file_date mayor). Dos ZONAS distintas el mismo día sí son filas distintas
+    # y se sumarán en el Paso 2.
+    # La clave de identidad es rider + día + zona (city_id, y city_name de respaldo).
+    # NO incluye métricas, para que una re-exportación con horas distintas no se
+    # cuente dos veces (ese era el bug del "doble exacto").
+    zona_cols = [c for c in ['city_id', 'city_name'] if c in base.columns]
+    ident_keys = ['driver_uuid', 'datestr'] + zona_cols
     base = (
-        base.sort(['file_date'], descending=True, nulls_last=True)
-            .unique(subset=dedup_keys, keep='first', maintain_order=True)
+        base.sort(['file_date', 'num_of_trips'], descending=[True, True], nulls_last=True)
+            .unique(subset=ident_keys, keep='first', maintain_order=True)
     )
 
     # --- Paso 2: sumar todas las zonas del mismo (uuid, día) ---
