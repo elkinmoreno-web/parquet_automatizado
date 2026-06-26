@@ -82,5 +82,3 @@ jobs:
         run: |
           rclone copy datos_salida/rides_silver.parquet "gdrive:" \
             --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
-          rclone copy datos_salida/rides_silver.csv "gdrive:" \
-            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
