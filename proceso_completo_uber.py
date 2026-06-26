@@ -534,33 +534,27 @@ def apply_adjustment(silver, rta, conn):
         pl.col('rta_madrugada').fill_null(0),
     ])
 
-    # Columnas de pedidos que se mueven con frac_rta
+    # Columnas de PEDIDOS y de HORAS — TODO se mueve con la MISMA fracción
+    # (frac_horas de Connections), para que viajes y horas viajen JUNTOS y el
+    # TPH quede coherente. Si frac_horas = 0 (no hubo madrugada confirmada por
+    # Connections), no se mueve NADA y el día conserva sus totales de Uber.
     PEDIDO_COLS = [c for c in ['num_of_trips', 'single_trips_total', 'accept_trips',
                                'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
                                'late_p2_trips', 'late_p3_trips'] if c in s.columns]
-    # Columnas de horas/distancia que se mueven con frac_horas
     HORA_COLS = [c for c in ['online_hours', 'active_hours', 'open_hours',
                              'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours',
                              'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min'] if c in s.columns]
 
     # --- Cantidad que se mueve al día anterior ---
-    # PEDIDOS: movemos el CONTEO EXACTO de madrugada que dice RTA (rta_madrugada),
-    # NO una proporción del total redondeada (eso inflaba por redondeo: p.ej.
-    # round(26 * 1/12) = 2 cuando la madrugada real era 1 viaje).
-    # Acotamos a que no se mueva más que el propio total del día (min_horizontal).
+    # Connections es la fuente ÚNICA de la madrugada (mide horas Y actividad con
+    # timestamps reales). RTA a veces no registra los pedidos de madrugada aunque
+    # el rider estuviera trabajando, así que usar RTA descuadraba (movía horas
+    # sin mover viajes). Con una sola fracción, viajes y horas se mueven juntos.
+    #   - HORAS: proporción exacta (decimal)
+    #   - PEDIDOS: proporción redondeada al entero (no hay medios viajes)
     mv_exprs = []
     for c in PEDIDO_COLS:
-        if c in ('num_of_trips', 'accept_trips', 'single_trips_total'):
-            # Mover el número entero de pedidos de madrugada, sin pasar del total del día
-            mv_exprs.append(
-                pl.min_horizontal(
-                    pl.col('rta_madrugada').fill_null(0).cast(pl.Float64),
-                    pl.col(c).fill_null(0),
-                ).alias('mv_' + c)
-            )
-        else:
-            # Resto de columnas de pedidos: proporción exacta
-            mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_rta')).round(0).alias('mv_' + c))
+        mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_horas')).round(0).alias('mv_' + c))
     for c in HORA_COLS:
         mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_horas')).alias('mv_' + c))
     s = s.with_columns(mv_exprs)
@@ -606,12 +600,13 @@ def apply_adjustment(silver, rta, conn):
               .otherwise(0.0).alias('pct_cancelacion')
         )
 
-    # Marcar si la fila tuvo movimiento (para inspección)
+    # Marcar si la fila tuvo movimiento de madrugada (frac_horas > 0) o recibió
+    # algo del día siguiente. Sirve para inspección en el dashboard.
     s = s.with_columns([
-        ((pl.col('frac_rta') > 0) | (pl.col('frac_horas') > 0) |
+        ((pl.col('frac_horas') > 0) |
          pl.col('in_num_of_trips').is_not_null()).alias('ajustado_connections'),
-        pl.col('frac_rta').alias('_frac_rta_dbg'),
         pl.col('frac_horas').alias('_frac_horas_dbg'),
+        pl.col('frac_rta').alias('_frac_rta_dbg'),
     ])
 
     # Limpiar auxiliares
