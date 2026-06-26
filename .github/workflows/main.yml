@@ -1,103 +1,87 @@
-name: Pipeline Producción (riders) V1.0
+name: Pipeline Producción (riders)
 
-# Corre cada 5 horas y también se puede disparar manualmente.
+# Corre cada hora (igual que el original) y también manualmente.
 on:
-  schedule:
-    - cron: '0 */5 * * *'   # cada 5 horas
-  workflow_dispatch:
+schedule:
+- cron: '13 * * * *'
+workflow_dispatch:
 
 jobs:
-  run-pipeline:
-    runs-on: ubuntu-latest
+run-pipeline:
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Descargar el código
-        uses: actions/checkout@v4
+steps:
+- name: Descargar el código
+uses: actions/checkout@v4
 
-      - name: Instalar Rclone
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y rclone
+- name: Instalar Rclone
+run: |
+         sudo apt-get update
+         sudo apt-get install -y rclone
 
-      - name: Configurar archivo de Rclone
-        run: |
-          mkdir -p ~/.config/rclone
-          cat << 'EOF' > ~/.config/rclone/rclone.conf
-          ${{ secrets.RCLONE_CONF }}
-          EOF
+     - name: Configurar archivo de Rclone
+run: |
+         mkdir -p ~/.config/rclone
+         cat << 'EOF' > ~/.config/rclone/rclone.conf
+         ${{ secrets.RCLONE_CONF }}
+         EOF
 
-      - name: Crear carpetas de trabajo
-        run: |
-          mkdir -p COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA datos_salida
+     - name: Crear carpetas de trabajo
+run: |
+         mkdir -p COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA datos_salida
 
-      # 1. BAJAR EL BRONZE EXISTENTE (histórico). Si no existe, no falla.
-      - name: Bajar bronce existente desde Drive
-        run: |
-          rclone copy "gdrive:" datos_salida/ \
-            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ \
-            --include "bronze_*.parquet" \
-            --transfers 8 --checkers 8 -v || echo "Sin bronce previo (primera corrida)"
+     # 1. BAJAR EL BRONZE EXISTENTE (histórico). Si no existe, no falla.
+- name: Bajar bronce existente desde Drive
+run: |
+         rclone copy "gdrive:" datos_salida/ \
+           --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ \
+           --include "bronze_*.parquet" \
+           --transfers 8 --checkers 8 -v || echo "Sin bronce previo (primera corrida)"
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+     # 2. BAJAR SOLO CSVs RECIENTES (paralelo + últimos 25 días)
+- name: Descargar COURIER_DAILY (reciente)
+run: |
+         rclone copy "gdrive:" COURIER_DAILY/ \
+           --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY \
+           --transfers 32 --checkers 32 --fast-list --max-age 25d -v
 
-      - name: Instalar librerías
-        run: |
-          python -m pip install --upgrade pip
-          pip install polars pyarrow
+     - name: Descargar CONNECTIONS (reciente)
+run: |
+         rclone copy "gdrive:" CONNECTIONS/ \
+           --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 \
+           --transfers 32 --checkers 32 --fast-list --max-age 25d -v
 
-      # 2. CALCULAR AUTOMÁTICAMENTE cuántos días bajar.
-      #    Lee el bronce y detecta el último dato procesado. Si lleva 4 días sin
-      #    correr, baja 4 días (+margen). Si corrió hoy, baja 2. Primera vez: 30.
-      - name: Calcular ventana de descarga
-        id: ventana
-        run: |
-          VENTANA=$(python3 calcular_ventana.py)
-          echo "Ventana detectada: ${VENTANA} días"
-          echo "dias=${VENTANA}" >> "$GITHUB_OUTPUT"
+     - name: Descargar CANCELLATIONS_RTA (reciente)
+run: |
+         rclone copy "gdrive:" CANCELLATIONS_RTA/ \
+           --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u \
+           --transfers 32 --checkers 32 --fast-list --max-age 25d -v
 
-      # 3. BAJAR SOLO LOS CSVs QUE FALTAN (ventana dinámica)
-      - name: Descargar COURIER_DAILY
-        run: |
-          rclone copy "gdrive:" COURIER_DAILY/ \
-            --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY \
-            --transfers 32 --checkers 32 --fast-list \
-            --max-age "${{ steps.ventana.outputs.dias }}d" --ignore-existing -v
+     - name: Configurar Python
+uses: actions/setup-python@v5
+with:
+python-version: '3.10'
 
-      - name: Descargar CONNECTIONS
-        run: |
-          rclone copy "gdrive:" CONNECTIONS/ \
-            --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 \
-            --transfers 64 --checkers 64 --fast-list \
-            --max-age "${{ steps.ventana.outputs.dias }}d" \
-            --ignore-existing --stats 30s -v
+- name: Instalar librerías
+run: |
+         python -m pip install --upgrade pip
+         pip install polars pyarrow
 
-      - name: Descargar CANCELLATIONS_RTA
-        run: |
-          # RTA genera ~288 archivos/día. El bronce ya guarda el histórico,
-          # así que la ventana dinámica baja solo lo que falta desde la última
-          # corrida (sin importar cuántos días lleve parado).
-          rclone copy "gdrive:" CANCELLATIONS_RTA/ \
-            --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u \
-            --transfers 64 --checkers 64 --fast-list \
-            --max-age "${{ steps.ventana.outputs.dias }}d" \
-            --ignore-existing --stats 30s -v
+     # 3. EJECUTAR PIPELINE (bronce viejo + CSVs nuevos → actualiza)
+- name: Ejecutar pipeline
+run: python proceso_completo_uber.py
 
-      # 4. EJECUTAR PIPELINE (bronce viejo + CSVs nuevos → actualiza)
-      - name: Ejecutar pipeline
-        run: python proceso_completo_uber.py
+# 4. SUBIR BRONZE ACTUALIZADO + el parquet de producción
+- name: Subir bronce actualizado a Drive
+run: |
+         rclone copy datos_salida/ "gdrive:" \
+           --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ \
+           --include "bronze_*.parquet" \
+           --transfers 8 --checkers 8 -v
 
-      # 4. SUBIR BRONZE ACTUALIZADO + el parquet de producción
-      - name: Subir bronce actualizado a Drive
-        run: |
-          rclone copy datos_salida/ "gdrive:" \
-            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ \
-            --include "bronze_*.parquet" \
-            --transfers 8 --checkers 8 -v
-
-      - name: Subir resultado a Drive
-        run: |
-          rclone copy datos_salida/rides_silver.parquet "gdrive:" \
+     - name: Subir resultado a Drive
+run: |
+         rclone copy datos_salida/rides_silver.parquet "gdrive:" \
+           --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
+          rclone copy datos_salida/rides_silver.csv "gdrive:" \
             --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
