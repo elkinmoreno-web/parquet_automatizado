@@ -454,40 +454,73 @@ def build_silver(bronze_daily):
 
 def reconstruct_connections(bronze_conn):
     """
-    Calcula, por (courier_uuid, FECHA REAL), la FRACCIÓN de horas conectado
-    que ocurrió antes de las 02:00 (madrugada). Esa fracción se usará para mover
-    esa parte de las horas del SILVER al día anterior.
+    Calcula, por (courier_uuid, FECHA REAL):
+      - frac_horas: fracción de horas antes de las 02:00 (para la regla 02:00)
+      - horas_conn: TOTAL de horas conectado del día (open+enroute+ontrip)
 
-    Horas = duración de open+enroute+ontrip (filas con end válido).
-    Cada fila se ancla por su start_time.
-      - frac_horas = horas de madrugada / horas totales del día
+    Cierre de sesiones: una sesión sin end_time se cierra con el INICIO del
+    siguiente evento del mismo rider (así no se pierden sus horas). Sesiones
+    absurdas (>18h, error de datos) se descartan.
+
+    horas_conn se usa como respaldo: si el online_hours del silver difiere
+    mucho de las horas reales (CSV incompleto), el ajuste usa horas_conn.
+
+    Una sesión que CRUZA las 02:00 cuenta solo la parte real antes del corte.
     """
     conn = bronze_conn.with_columns([
         pl.col('start_time').str.to_datetime(strict=False).alias('start_dt'),
         pl.col('end_time').str.to_datetime(strict=False).alias('end_dt'),
     ]).filter(pl.col('start_dt').is_not_null())
 
-    # Solo estados que cuentan como horas, con fin válido
-    conn = conn.filter(pl.col('status').is_in(WORK_STATES) & pl.col('end_dt').is_not_null())
+    # Cerrar sesiones sin end_time con el inicio del siguiente evento del rider
+    conn = conn.sort(['courier_uuid', 'start_dt'])
+    conn = conn.with_columns(
+        pl.col('start_dt').shift(-1).over('courier_uuid').alias('next_start')
+    )
+    conn = conn.with_columns(
+        pl.when(pl.col('end_dt').is_not_null()).then(pl.col('end_dt'))
+          .otherwise(pl.col('next_start')).alias('end_eff')
+    )
+
+    # Solo estados de trabajo, con fin efectivo válido y posterior al inicio
+    conn = conn.filter(
+        pl.col('status').is_in(WORK_STATES) &
+        pl.col('end_eff').is_not_null() &
+        (pl.col('end_eff') > pl.col('start_dt'))
+    )
+
+    # Límite de las 02:00 del día de cada sesión (según start_dt)
+    conn = conn.with_columns(
+        pl.col('start_dt').dt.truncate('1d').dt.offset_by(f'{LOGICAL_DAY_CUTOFF_HOUR}h').alias('corte_02h')
+    )
     conn = conn.with_columns([
         pl.col('start_dt').dt.date().alias('fecha_real'),
-        (pl.col('start_dt').dt.hour() < LOGICAL_DAY_CUTOFF_HOUR).alias('es_madrugada'),
-        ((pl.col('end_dt') - pl.col('start_dt')).dt.total_seconds() / 3600).alias('dur_h'),
+        ((pl.col('end_eff') - pl.col('start_dt')).dt.total_seconds() / 3600).alias('dur_h'),
+        # Parte real antes de las 02:00 (solo si la sesión empieza antes del corte):
+        pl.when(pl.col('start_dt') < pl.col('corte_02h'))
+          .then(
+              (pl.min_horizontal(pl.col('end_eff'), pl.col('corte_02h')) - pl.col('start_dt'))
+              .dt.total_seconds() / 3600
+          )
+          .otherwise(0.0).alias('dur_madrugada'),
     ])
+    # Descartar sesiones absurdas (error de datos) y madrugada negativa
+    conn = conn.filter(pl.col('dur_h') <= 18)
+    conn = conn.with_columns(pl.col('dur_madrugada').clip(lower_bound=0.0))
 
     g = (
         conn.group_by(['courier_uuid', 'fecha_real']).agg([
-            pl.col('dur_h').sum().alias('horas_total'),
-            (pl.col('dur_h') * pl.col('es_madrugada').cast(pl.Float64)).sum().alias('horas_madrugada'),
+            pl.col('dur_h').sum().alias('horas_conn'),
+            pl.col('dur_madrugada').sum().alias('horas_madrugada'),
         ])
     )
     g = g.with_columns(
-        pl.when(pl.col('horas_total') > 0)
-          .then(pl.col('horas_madrugada') / pl.col('horas_total'))
+        pl.when(pl.col('horas_conn') > 0)
+          .then((pl.col('horas_madrugada') / pl.col('horas_conn')).clip(upper_bound=1.0))
           .otherwise(0.0).alias('frac_horas')
     )
     g = g.rename({'fecha_real': 'dia'})
-    return g.select(['courier_uuid', 'dia', 'frac_horas', 'horas_total', 'horas_madrugada'])
+    return g.select(['courier_uuid', 'dia', 'frac_horas', 'horas_conn', 'horas_madrugada'])
 
 
 def apply_adjustment(silver, rta, conn):
@@ -523,16 +556,32 @@ def apply_adjustment(silver, rta, conn):
     else:
         s = s.with_columns([pl.lit(0.0).alias('frac_rta'), pl.lit(0).alias('rta_madrugada')])
     if conn is not None and len(conn) > 0:
-        s = s.join(conn.select(['courier_uuid', 'dia', 'frac_horas']),
+        s = s.join(conn.select(['courier_uuid', 'dia', 'frac_horas', 'horas_conn']),
                    left_on=['driver_uuid', '_dia'], right_on=['courier_uuid', 'dia'], how='left')
     else:
-        s = s.with_columns(pl.lit(0.0).alias('frac_horas'))
+        s = s.with_columns([pl.lit(0.0).alias('frac_horas'), pl.lit(None).cast(pl.Float64).alias('horas_conn')])
 
     s = s.with_columns([
         pl.col('frac_rta').fill_null(0.0),
         pl.col('frac_horas').fill_null(0.0),
         pl.col('rta_madrugada').fill_null(0),
     ])
+
+    # --- Corrección de horas incompletas del silver (Opción B) ---
+    # El online_hours del CSV de Uber a veces llega incompleto (el día no se
+    # había consolidado al exportar). Si Connections difiere en más de 1 hora,
+    # usamos las horas de Connections (que coinciden con el panel de Uber).
+    # El 95% de los días coinciden, así que esto solo corrige el ~4% problemático.
+    if 'horas_conn' in s.columns and 'online_hours' in s.columns:
+        s = s.with_columns(
+            pl.when(
+                pl.col('horas_conn').is_not_null() &
+                ((pl.col('horas_conn') - pl.col('online_hours')).abs() > 1.0)
+            )
+            .then(pl.col('horas_conn'))
+            .otherwise(pl.col('online_hours'))
+            .alias('online_hours')
+        )
 
     # Columnas de PEDIDOS y de HORAS — TODO se mueve con la MISMA fracción
     # (frac_horas de Connections), para que viajes y horas viajen JUNTOS y el
@@ -610,7 +659,7 @@ def apply_adjustment(silver, rta, conn):
     ])
 
     # Limpiar auxiliares
-    aux = ['frac_rta', 'frac_horas', 'rta_madrugada'] + ['mv_' + c for c in PEDIDO_COLS + HORA_COLS] + \
+    aux = ['frac_rta', 'frac_horas', 'rta_madrugada', 'horas_conn'] + ['mv_' + c for c in PEDIDO_COLS + HORA_COLS] + \
           ['in_' + c for c in PEDIDO_COLS + HORA_COLS]
     s = s.drop([c for c in aux if c in s.columns])
     return s
