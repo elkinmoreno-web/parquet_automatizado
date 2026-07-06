@@ -2,7 +2,7 @@
 """
 Pipeline Closer Logistics — Viajes + Connections con regla de las 02:00
 =======================================================================
-VERSIÓN: v2.1-fix-markets  (2026-07-06)
+VERSIÓN: v2.2-fix-markets-rapido  (2026-07-06)
 
 CAMBIOS vs v2.0 (los dos fixes están marcados con "FIX v2.1"):
 
@@ -32,13 +32,20 @@ CAMBIOS vs v2.0 (los dos fixes están marcados con "FIX v2.1"):
 El resto es idéntico a v2.0.
 """
 
-PIPELINE_VERSION = "v2.1-fix-markets"
+PIPELINE_VERSION = "v2.2-fix-markets-rapido"
 
 import os
 import re
 import glob
+import time
 from datetime import datetime, timedelta
 import polars as pl
+
+# --- Cronómetro sencillo: cada fase imprime cuánto tardó -------------------
+_T0 = time.time()
+def marca(msg):
+    """Imprime el mensaje con el tiempo transcurrido desde el inicio."""
+    print(f"[{time.time()-_T0:7.1f}s] {msg}")
 
 # =============================================================================
 # CONFIGURACIÓN
@@ -177,9 +184,14 @@ def ingest_bronze_daily():
     if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
     if not parts:
         return None
+    # ★ v2.2: si no hay archivos nuevos, NO reescribir el parquet (ahorra
+    # minutos si la carpeta está en un disco lento o sincronizado).
+    if not new_dfs:
+        marca("[daily] Sin archivos nuevos — bronze sin cambios, no se reescribe")
+        return existing
     bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
     bronze.write_parquet(BRONZE_DAILY_PARQUET, compression='zstd')
-    print(f"[daily] Bronze guardado: {len(bronze):,} filas")
+    marca(f"[daily] Bronze guardado: {len(bronze):,} filas")
     return bronze
 
 
@@ -241,14 +253,19 @@ def ingest_bronze_connections():
     if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
     if not parts:
         return None
+    # ★ v2.2: sin archivos nuevos → el bronze ya está deduplicado de la vez
+    # anterior; no hay que deduplicar ni reescribir nada.
+    if not new_dfs:
+        marca("[conn] Sin archivos nuevos — bronze sin cambios, no se reescribe")
+        return existing
     bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
 
     before = len(bronze)
     bronze = bronze.unique(subset=['courier_uuid', 'start_time', 'status'], keep='first')
-    print(f"[conn] Dedup: {before:,} → {len(bronze):,} filas")
+    marca(f"[conn] Dedup: {before:,} → {len(bronze):,} filas")
 
     bronze.write_parquet(BRONZE_CONN_PARQUET, compression='zstd')
-    print(f"[conn] Bronze guardado: {len(bronze):,} filas")
+    marca(f"[conn] Bronze guardado: {len(bronze):,} filas")
     return bronze
 
 
@@ -306,14 +323,18 @@ def ingest_bronze_rta():
     if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
     if not parts:
         return None
+    # ★ v2.2: sin archivos nuevos → no deduplicar ni reescribir.
+    if not new_dfs:
+        marca("[rta] Sin archivos nuevos — bronze sin cambios, no se reescribe")
+        return existing
     bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
 
     before = len(bronze)
     bronze = bronze.unique(subset=['offer_id'], keep='first')
-    print(f"[rta] Dedup por offer_id: {before:,} → {len(bronze):,} filas")
+    marca(f"[rta] Dedup por offer_id: {before:,} → {len(bronze):,} filas")
 
     bronze.write_parquet(BRONZE_RTA_PARQUET, compression='zstd')
-    print(f"[rta] Bronze guardado: {len(bronze):,} filas")
+    marca(f"[rta] Bronze guardado: {len(bronze):,} filas")
     return bronze
 
 
@@ -321,14 +342,19 @@ def ingest_bronze_rta():
 # 3. RTA — fracción de pedidos de madrugada  [SIN CAMBIOS]
 # =============================================================================
 
-def reconstruct_rta(bronze_rta):
+def reconstruct_rta(bronze_rta, fecha_min=None):
     """
     Calcula, por (courier_uuid, FECHA REAL), la FRACCIÓN de pedidos que ocurrió
     antes de las 02:00 (madrugada). Solo informativo/debug.
+
+    ★ v2.2: fecha_min recorta a la ventana que de verdad se usa (con margen),
+    en vez de procesar todo el histórico.
     """
     r = bronze_rta.with_columns(
         pl.col('timestamp').str.to_datetime(strict=False).alias('ts')
     ).filter(pl.col('ts').is_not_null())
+    if fecha_min is not None:
+        r = r.filter(pl.col('ts') >= fecha_min)
 
     r = r.filter(pl.col('courier_action') == 'ACCEPT')
     r = r.with_columns([
@@ -380,6 +406,16 @@ def build_silver(bronze_daily):
     base = bronze_daily.filter(
         pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null()
     )
+
+    # ★ v2.2: recortar a la ventana ANTES de procesar. El silver final solo
+    # cubre las últimas REPROCESS_WEEKS semanas, así que no tiene sentido
+    # deduplicar y sumar TODO el histórico (millones de filas) para luego
+    # tirar el 90%. Cada (rider, día) se procesa igual; solo procesamos menos días.
+    max_day = base.select(pl.col('datestr').max()).item()
+    cutoff = None
+    if max_day is not None:
+        cutoff = max_day - timedelta(weeks=REPROCESS_WEEKS)
+        base = base.filter(pl.col('datestr') >= cutoff)
 
     # --- Paso 1 (FIX v2.1): quedarnos con la FOTO más reciente de cada (uuid, día) ---
     base = (
@@ -438,11 +474,8 @@ def build_silver(bronze_daily):
     if recalcs:
         silver = silver.with_columns(recalcs)
 
-    # Recorte a la ventana reciente
-    max_day = silver.select(pl.col('datestr').max()).item()
-    if max_day is not None:
-        cutoff = max_day - timedelta(weeks=REPROCESS_WEEKS)
-        silver = silver.filter(pl.col('datestr') >= cutoff)
+    # La ventana ya se recortó al inicio (v2.2); solo informamos.
+    if cutoff is not None:
         print(f"[silver] Ventana: {cutoff.date()} → {max_day.date()} ({len(silver):,} filas)")
     return silver
 
@@ -451,7 +484,7 @@ def build_silver(bronze_daily):
 # 4. AJUSTE desde CONNECTIONS (regla de las 02:00)
 # =============================================================================
 
-def reconstruct_connections(bronze_conn):
+def reconstruct_connections(bronze_conn, fecha_min=None):
     """
     Calcula, por (courier_uuid, FECHA REAL):
       - frac_horas: fracción de horas antes de las 02:00 (para la regla 02:00)
@@ -467,11 +500,16 @@ def reconstruct_connections(bronze_conn):
       y su parte antes de las 02:00 sí se detecta como madrugada. Así el
       cálculo por día calendario queda alineado con cómo cuenta el CSV, y la
       regla de las 02:00 lo devuelve al día anterior.
+
+    ★ v2.2: fecha_min recorta a la ventana que de verdad se usa (con margen),
+    en vez de ordenar y agrupar todo el histórico de sesiones.
     """
     conn = bronze_conn.with_columns([
         pl.col('start_time').str.to_datetime(strict=False).alias('start_dt'),
         pl.col('end_time').str.to_datetime(strict=False).alias('end_dt'),
     ]).filter(pl.col('start_dt').is_not_null())
+    if fecha_min is not None:
+        conn = conn.filter(pl.col('start_dt') >= fecha_min)
 
     conn = conn.sort(['courier_uuid', 'start_dt'])
     conn = conn.with_columns(
@@ -679,17 +717,27 @@ def apply_adjustment(silver, rta, conn):
 # =============================================================================
 
 def main():
+    marca("Inicio")
     bronze_daily = ingest_bronze_daily()
+    marca("Ingesta COURIER_DAILY lista")
     if bronze_daily is None:
         print("\n✗ No hay datos de COURIER_DAILY. Abortando.")
         return
     bronze_conn = ingest_bronze_connections()
+    marca("Ingesta CONNECTIONS lista")
     bronze_rta  = ingest_bronze_rta()
+    marca("Ingesta RTA lista")
 
     print("\n--- Construyendo silver ---")
     n_bronze = len(bronze_daily)
     silver = build_silver(bronze_daily)
+    marca("Silver construido")
     print(f"[silver] Bronze daily: {n_bronze:,} filas → silver: {len(silver):,} filas (rider+día únicos)")
+
+    # ★ v2.2: ventana con margen para recortar Connections/RTA (la madrugada
+    # del primer día de la ventana puede venir de sesiones del día anterior)
+    ventana_min = silver.select(pl.col('datestr').min()).item()
+    fecha_min = (ventana_min - timedelta(days=2)) if ventana_min is not None else None
     _dup = (silver.with_columns(pl.col('datestr').dt.date().alias('_d'))
                   .group_by(['driver_uuid', '_d']).agg(pl.len().alias('n'))
                   .filter(pl.col('n') > 1))
@@ -698,16 +746,24 @@ def main():
 
     recon_conn = None
     if bronze_conn is not None and len(bronze_conn) > 0:
-        recon_conn = reconstruct_connections(bronze_conn)
+        recon_conn = reconstruct_connections(bronze_conn, fecha_min)
+        marca("Connections reconstruido")
         print(f"[conn] Reconstrucción: {len(recon_conn):,} combinaciones (rider, día)")
 
     recon_rta = None
     if bronze_rta is not None and len(bronze_rta) > 0:
-        recon_rta = reconstruct_rta(bronze_rta)
+        recon_rta = reconstruct_rta(bronze_rta, fecha_min)
+        marca("RTA reconstruido")
         print(f"[rta] Reconstrucción: {len(recon_rta):,} combinaciones (rider, día)")
 
     if recon_conn is not None or recon_rta is not None:
         final = apply_adjustment(silver, recon_rta, recon_conn)
+        marca("Ajuste 02:00 aplicado")
+        # El full join puede crear una fila justo ANTES de la ventana
+        # (madrugada del primer día movida al día anterior): la quitamos
+        # para que el parquet cubra exactamente la ventana.
+        if ventana_min is not None:
+            final = final.filter(pl.col('datestr') >= ventana_min)
         n_mov = final.filter(pl.col('ajustado_connections')).height
         print(f"[ajuste] Filas con movimiento de madrugada: {n_mov:,} / {len(final):,}")
     else:
@@ -731,6 +787,7 @@ def main():
         print(f"[limpieza] Filas vacías eliminadas (0 viajes y 0 horas): {quitadas}")
 
     final.write_parquet(SILVER_PARQUET, compression='zstd')
+    marca(f"Parquet final escrito")
     print(f"\n✓ Parquet final: {SILVER_PARQUET} ({len(final):,} filas)")
 
     dups = (final.with_columns(pl.col('datestr').dt.date().alias('_d'))
