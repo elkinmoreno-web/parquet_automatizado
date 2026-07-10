@@ -2,7 +2,7 @@ name: Pipeline Producción (riders)
 
 on:
   schedule:
-    - cron: '13 * * * *'
+    - cron: '13 */8 * * *'
   workflow_dispatch:
 
 jobs:
