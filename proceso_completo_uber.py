@@ -2,72 +2,60 @@
 """
 Pipeline Closer Logistics — Viajes + Connections con regla de las 02:00
 =======================================================================
-VERSIÓN: v2.2-fix-markets-rapido  (2026-07-06)
+VERSIÓN: v2.0-connections-only  (2026-06-02)
 
-CAMBIOS vs v2.0 (los dos fixes están marcados con "FIX v2.1"):
-
-  FIX 1 — build_silver (EL BUG DE LOS VIAJES QUE FALTABAN):
-    Uber puede traer VARIAS filas para el mismo rider y el mismo día con la
-    MISMA ciudad (city_name=MADRID) pero distinto market_name (p. ej.
-    MADRID CENTRO + MADRID VALLECAS = dos turnos reales del mismo día).
-    El dedup viejo usaba la clave (uuid, día, city_id, city_name), veía esas
-    dos filas como "versiones duplicadas" y BORRABA una → se perdían viajes.
-    (Caso real: Jose Gregorio 01/07 → CENTRO 8 viajes + VALLECAS 11 = 19,
-    pero el silver se quedaba solo con 11.)
-    Las horas parecían bien porque la corrección con Connections las
-    "rescataba", pero los viajes no tienen rescate → dashboard con menos pedidos.
-
-    Solución: para cada (rider, día) nos quedamos con TODAS las filas del
-    ARCHIVO MÁS RECIENTE que contenga ese (rider, día), y las sumamos.
-    Cada archivo es una "foto" completa del día → la foto más nueva manda.
-    Así da igual si Uber parte el día por market, city, form_factor o lo
-    que sea: se suma todo lo que venga en la foto más reciente.
-
-  FIX 2 — apply_adjustment:
-    Si un rider trabajó SOLO de madrugada el día D (y no trabajó el día D-1),
-    lo movido a D-1 caía en un día sin fila en el silver y se PERDÍA
-    (el join era 'left'). Ahora el join es 'full': si D-1 no existe, se crea
-    la fila y los viajes/horas movidos no se pierden.
-
-El resto es idéntico a v2.0.
+  TODO se calcula desde Connections (viajes, horas, aceptados, cancelados,
+  % aceptación, % cancelación). El silver solo aporta metadatos del rider.
+  Días sin cobertura de Connections se descartan.
 """
 
-PIPELINE_VERSION = "v2.2-fix-markets-rapido"
+PIPELINE_VERSION = "v5.0-silver-movido-02h"
 
 import os
+import io
 import re
 import glob
-import time
-from datetime import datetime, timedelta
+import json
+import gzip
+import base64
+from datetime import datetime, date, timedelta
 import polars as pl
-
-# --- Cronómetro sencillo: cada fase imprime cuánto tardó -------------------
-_T0 = time.time()
-def marca(msg):
-    """Imprime el mensaje con el tiempo transcurrido desde el inicio."""
-    print(f"[{time.time()-_T0:7.1f}s] {msg}")
+from supabase import create_client
 
 # =============================================================================
 # CONFIGURACIÓN
 # =============================================================================
 
+# Carpetas de entrada (configurables por variable de entorno para staging)
 COURIER_DAILY_DIR = os.environ.get('COURIER_DAILY_DIR', 'COURIER_DAILY')
 CONNECTIONS_DIR   = os.environ.get('CONNECTIONS_DIR', 'CONNECTIONS')
 RTA_DIR           = os.environ.get('RTA_DIR', 'CANCELLATIONS_RTA')
 
+# Carpeta de salida
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'datos_salida')
+
+# Nombre del parquet final (en staging usamos otro para no pisar producción)
 SILVER_NAME = os.environ.get('SILVER_NAME', 'rides_silver')
+
+# Sufijo para los bronze (en staging '_STAGING' para no mezclar con producción)
 BRONZE_SUFFIX = os.environ.get('BRONZE_SUFFIX', '')
 
+# Parquets de histórico (bronze incremental)
 BRONZE_DAILY_PARQUET = os.path.join(OUTPUT_DIR, 'bronze_daily' + BRONZE_SUFFIX + '.parquet')
 BRONZE_CONN_PARQUET  = os.path.join(OUTPUT_DIR, 'bronze_connections' + BRONZE_SUFFIX + '.parquet')
 BRONZE_RTA_PARQUET   = os.path.join(OUTPUT_DIR, 'bronze_rta' + BRONZE_SUFFIX + '.parquet')
 
+# Salidas finales
 SILVER_PARQUET = os.path.join(OUTPUT_DIR, SILVER_NAME + '.parquet')
 
+# Ventana de reproceso: cuántas semanas hacia atrás recalcular silver+ajuste.
+# 3 semanas cubre la regla de 2 semanas del dashboard + margen.
 REPROCESS_WEEKS = 3
+
+# Hora de corte del día lógico (registros antes de esto → día anterior)
 LOGICAL_DAY_CUTOFF_HOUR = 2
 
+# Patrones de archivo
 DAILY_PATTERN = re.compile(r'COURIER_DAILY.*\.csv$', re.IGNORECASE)
 CONN_PATTERN  = re.compile(r'connections.*\.csv$', re.IGNORECASE)
 RTA_PATTERN   = re.compile(r'CANCELLATION.*\.csv$', re.IGNORECASE)
@@ -100,7 +88,7 @@ def detect_sep(path):
 
 
 # =============================================================================
-# 1. BRONZE — COURIER_DAILY (incremental)  [SIN CAMBIOS]
+# 1. BRONZE — COURIER_DAILY (incremental)
 # =============================================================================
 
 CANONICAL_DAILY = [
@@ -144,6 +132,7 @@ def parse_daily_csv(filepath, file_name, file_ts):
 
 
 def ingest_bronze_daily():
+    # Histórico previo
     processed = set()
     existing = None
     if os.path.exists(BRONZE_DAILY_PARQUET):
@@ -153,6 +142,7 @@ def ingest_bronze_daily():
     else:
         print("[daily] Sin bronze previo (primera ejecución)")
 
+    # Archivos en disco
     files = []
     for path in glob.glob(os.path.join(COURIER_DAILY_DIR, '*.csv')):
         name = os.path.basename(path)
@@ -160,6 +150,7 @@ def ingest_bronze_daily():
             continue
         files.append({'path': path, 'name': name, 'ts': extract_ts(name) or datetime.min})
 
+    # Quedarse con el más reciente por día (igual que el pipeline viejo)
     por_dia = {}
     for f in files:
         d = f['ts'].date()
@@ -184,19 +175,14 @@ def ingest_bronze_daily():
     if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
     if not parts:
         return None
-    # ★ v2.2: si no hay archivos nuevos, NO reescribir el parquet (ahorra
-    # minutos si la carpeta está en un disco lento o sincronizado).
-    if not new_dfs:
-        marca("[daily] Sin archivos nuevos — bronze sin cambios, no se reescribe")
-        return existing
     bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
     bronze.write_parquet(BRONZE_DAILY_PARQUET, compression='zstd')
-    marca(f"[daily] Bronze guardado: {len(bronze):,} filas")
+    print(f"[daily] Bronze guardado: {len(bronze):,} filas")
     return bronze
 
 
 # =============================================================================
-# 2. BRONZE — CONNECTIONS (incremental)  [SIN CAMBIOS]
+# 2. BRONZE — CONNECTIONS (incremental)
 # =============================================================================
 
 CONN_COLS = ['courier_uuid', 'courier_name', 'contact_number', 'fleet_name', 'status',
@@ -205,13 +191,19 @@ CONN_COLS = ['courier_uuid', 'courier_name', 'contact_number', 'fleet_name', 'st
 
 def parse_conn_csv(filepath, file_name):
     sep = detect_sep(filepath)
+    # infer_schema=False lee TODO como texto. Evita errores como
+    # "could not parse 613368445.0 as i64" cuando el móvil viene con .0,
+    # o problemas si una columna mezcla tipos entre archivos. Convertimos
+    # los tipos que necesitemos a mano más abajo.
     df = pl.read_csv(
         filepath, separator=sep, infer_schema=False,
         null_values=['', 'NA', 'null', 'NULL', '\\N'],
         truncate_ragged_lines=True,
     )
+    # Conservar solo columnas que nos interesan (si existen)
     keep = [c for c in CONN_COLS if c in df.columns]
     df = df.select(keep)
+    # Normalizar tipos clave a texto para dedup estable
     for c in ['courier_uuid', 'status', 'start_time', 'end_time']:
         if c in df.columns:
             df = df.with_columns(pl.col(c).cast(pl.Utf8, strict=False))
@@ -253,24 +245,20 @@ def ingest_bronze_connections():
     if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
     if not parts:
         return None
-    # ★ v2.2: sin archivos nuevos → el bronze ya está deduplicado de la vez
-    # anterior; no hay que deduplicar ni reescribir nada.
-    if not new_dfs:
-        marca("[conn] Sin archivos nuevos — bronze sin cambios, no se reescribe")
-        return existing
     bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
 
+    # Dedup incremental: (courier_uuid, start_time, status) — los archivos pueden solapar
     before = len(bronze)
     bronze = bronze.unique(subset=['courier_uuid', 'start_time', 'status'], keep='first')
-    marca(f"[conn] Dedup: {before:,} → {len(bronze):,} filas")
+    print(f"[conn] Dedup: {before:,} → {len(bronze):,} filas")
 
     bronze.write_parquet(BRONZE_CONN_PARQUET, compression='zstd')
-    marca(f"[conn] Bronze guardado: {len(bronze):,} filas")
+    print(f"[conn] Bronze guardado: {len(bronze):,} filas")
     return bronze
 
 
 # =============================================================================
-# 2b. BRONZE — CANCELLATIONS_RTA (incremental)  [SIN CAMBIOS]
+# 2b. BRONZE — CANCELLATIONS_RTA (incremental) — pedidos individuales
 # =============================================================================
 
 RTA_COLS = ['timestamp', 'courier_uuid', 'offer_id', 'courier_action',
@@ -323,39 +311,37 @@ def ingest_bronze_rta():
     if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
     if not parts:
         return None
-    # ★ v2.2: sin archivos nuevos → no deduplicar ni reescribir.
-    if not new_dfs:
-        marca("[rta] Sin archivos nuevos — bronze sin cambios, no se reescribe")
-        return existing
     bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
 
+    # Dedup incremental por offer_id (cada pedido es único; archivos solapan)
     before = len(bronze)
     bronze = bronze.unique(subset=['offer_id'], keep='first')
-    marca(f"[rta] Dedup por offer_id: {before:,} → {len(bronze):,} filas")
+    print(f"[rta] Dedup por offer_id: {before:,} → {len(bronze):,} filas")
 
     bronze.write_parquet(BRONZE_RTA_PARQUET, compression='zstd')
-    marca(f"[rta] Bronze guardado: {len(bronze):,} filas")
+    print(f"[rta] Bronze guardado: {len(bronze):,} filas")
     return bronze
 
 
 # =============================================================================
-# 3. RTA — fracción de pedidos de madrugada  [SIN CAMBIOS]
+# 3. SILVER (dedup del daily) + recorte a ventana reciente
 # =============================================================================
 
-def reconstruct_rta(bronze_rta, fecha_min=None):
+def reconstruct_rta(bronze_rta):
     """
     Calcula, por (courier_uuid, FECHA REAL), la FRACCIÓN de pedidos que ocurrió
-    antes de las 02:00 (madrugada). Solo informativo/debug.
+    antes de las 02:00 (madrugada). Esa fracción se usará para mover esa parte
+    de los totales del SILVER al día anterior.
 
-    ★ v2.2: fecha_min recorta a la ventana que de verdad se usa (con margen),
-    en vez de procesar todo el histórico.
+    Cada offer_id es un pedido individual. Solo contamos ACCEPT (pedidos que
+    aceptó). Cada pedido se ancla por su timestamp.
+      - frac_rta = pedidos ACCEPT de madrugada / pedidos ACCEPT totales del día
     """
     r = bronze_rta.with_columns(
         pl.col('timestamp').str.to_datetime(strict=False).alias('ts')
     ).filter(pl.col('ts').is_not_null())
-    if fecha_min is not None:
-        r = r.filter(pl.col('ts') >= fecha_min)
 
+    # Solo ACCEPT (pedidos aceptados). FECHA REAL del calendario.
     r = r.filter(pl.col('courier_action') == 'ACCEPT')
     r = r.with_columns([
         pl.col('ts').dt.date().alias('fecha_real'),
@@ -378,59 +364,38 @@ def reconstruct_rta(bronze_rta, fecha_min=None):
 
 
 # =============================================================================
-# SILVER  ★★★ FIX v2.1 — AQUÍ ESTABA EL BUG DE LOS VIAJES PERDIDOS ★★★
+# SILVER
 # =============================================================================
 
 def build_silver(bronze_daily):
     """
-    Construye el silver con UNA fila por (driver_uuid, día), sumando TODOS los
-    turnos del mismo día (markets/zonas distintas, p. ej. CENTRO + VALLECAS).
+    Construye el silver con UNA fila por (driver_uuid, día), pero SUMANDO los
+    turnos partidos / zonas distintas del mismo día (p. ej. CARABANCHEL + CENTRO).
 
-    ★ FIX v2.1 — Cómo se eligen las filas correctas:
-
-      Cada archivo CSV de Uber es una "FOTO" completa de cada (rider, día):
-      puede traer 1 fila o VARIAS (una por market/zona en que trabajó).
-      Un archivo más nuevo trae la foto más consolidada de ese día.
-
-      Por eso, para cada (rider, día):
-        1) Buscamos el archivo MÁS RECIENTE que contenga ese (rider, día).
-        2) Nos quedamos con TODAS sus filas de ese archivo (la foto completa).
-        3) Las sumamos.
-
-      El dedup viejo usaba la clave (uuid, día, city_id, city_name) y por eso
-      dos markets del mismo día con la MISMA ciudad (MADRID CENTRO y
-      MADRID VALLECAS → ambos city_name=MADRID) parecían "duplicados" y se
-      borraba uno → viajes perdidos. Con la lógica de "foto más reciente
-      completa" da igual en qué columna venga partido el día: se suma todo.
+    Dos pasos:
+      1) Dedup de VERSIONES por (uuid, día, zona): si la misma zona viene
+         en varios CSVs (re-exportaciones), nos quedamos con la más reciente
+         (file_date mayor). Dos ZONAS distintas el mismo día son turnos reales
+         y se conservan ambas para sumarlas en el Paso 2.
+         La clave NO incluye métricas para que decimales distintos entre
+         exportaciones no creen filas "distintas" que se sumen (bug del doble).
+      2) SUMA por (uuid, día): se suman horas, viajes, km y min de todas las zonas.
+         Las métricas promedio/derivadas (_avg) se RECALCULAN sobre los totales.
     """
     base = bronze_daily.filter(
         pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null()
     )
 
-    # ★ v2.2: recortar a la ventana ANTES de procesar. El silver final solo
-    # cubre las últimas REPROCESS_WEEKS semanas, así que no tiene sentido
-    # deduplicar y sumar TODO el histórico (millones de filas) para luego
-    # tirar el 90%. Cada (rider, día) se procesa igual; solo procesamos menos días.
-    max_day = base.select(pl.col('datestr').max()).item()
-    cutoff = None
-    if max_day is not None:
-        cutoff = max_day - timedelta(weeks=REPROCESS_WEEKS)
-        base = base.filter(pl.col('datestr') >= cutoff)
-
-    # --- Paso 1 (FIX v2.1): quedarnos con la FOTO más reciente de cada (uuid, día) ---
+    # --- Paso 1: una versión por (uuid, día, zona) ---
+    zona_cols = [c for c in ['city_id', 'city_name'] if c in base.columns]
+    ident_keys = ['driver_uuid', 'datestr'] + zona_cols
     base = (
-        base.with_columns(
-            pl.col('file_date').max().over(['driver_uuid', 'datestr']).alias('_max_fd')
-        )
-        .filter(pl.col('file_date') == pl.col('_max_fd'))
-        .drop('_max_fd')
+        base.sort(['file_date', 'num_of_trips'], descending=[True, True], nulls_last=True)
+            .unique(subset=ident_keys, keep='first', maintain_order=True)
     )
-    # Seguridad: si el MISMO export se guardó dos veces con nombres distintos
-    # (mismo timestamp en el nombre), quitamos filas 100% idénticas en datos.
-    canon_present = [c for c in CANONICAL_DAILY if c in base.columns]
-    base = base.unique(subset=canon_present, keep='first')
 
-    # --- Paso 2: sumar todas las filas (markets/zonas) del mismo (uuid, día) ---
+    # --- Paso 2: sumar todas las zonas del mismo (uuid, día) ---
+    # Columnas que se SUMAN (cantidades absolutas)
     SUM_COLS = [c for c in [
         'online_hours', 'active_hours', 'open_hours',
         'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours',
@@ -439,7 +404,8 @@ def build_silver(bronze_daily):
         'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min',
     ] if c in base.columns]
 
-    # Texto/identidad: tomamos la del turno con más viajes (venimos ordenados así)
+    # Columnas de texto/identidad: tomamos la primera (la de la zona con más viajes,
+    # porque venimos ordenados por num_of_trips desc dentro del día)
     FIRST_COLS = [c for c in [
         'weekstr', 'driver_name', 'driver_number', 'driver_email',
         'fleet_name', 'city_id', 'city_name', 'market_name', 'form_factor',
@@ -474,8 +440,11 @@ def build_silver(bronze_daily):
     if recalcs:
         silver = silver.with_columns(recalcs)
 
-    # La ventana ya se recortó al inicio (v2.2); solo informamos.
-    if cutoff is not None:
+    # Recorte a la ventana reciente para reprocesar rápido
+    max_day = silver.select(pl.col('datestr').max()).item()
+    if max_day is not None:
+        cutoff = max_day - timedelta(weeks=REPROCESS_WEEKS)
+        silver = silver.filter(pl.col('datestr') >= cutoff)
         print(f"[silver] Ventana: {cutoff.date()} → {max_day.date()} ({len(silver):,} filas)")
     return silver
 
@@ -484,33 +453,27 @@ def build_silver(bronze_daily):
 # 4. AJUSTE desde CONNECTIONS (regla de las 02:00)
 # =============================================================================
 
-def reconstruct_connections(bronze_conn, fecha_min=None):
+def reconstruct_connections(bronze_conn):
     """
     Calcula, por (courier_uuid, FECHA REAL):
       - frac_horas: fracción de horas antes de las 02:00 (para la regla 02:00)
       - horas_conn: TOTAL de horas conectado del día (open+enroute+ontrip)
 
-    ★ FIX v2.1 — Sesiones que CRUZAN la medianoche:
-      Antes, una sesión 23:32 → 00:10 se anclaba entera al día en que EMPEZABA,
-      y como empezaba después de las 02:00 su "madrugada" era 0. Resultado:
-      los minutos después de medianoche (00:00–02:00) nunca se detectaban como
-      madrugada del día siguiente y NO se movían al día anterior (el CSV de
-      Uber sí los apunta al día siguiente). Ahora cada sesión se PARTE en la
-      medianoche: el trozo de después de las 00:00 cuenta como día siguiente
-      y su parte antes de las 02:00 sí se detecta como madrugada. Así el
-      cálculo por día calendario queda alineado con cómo cuenta el CSV, y la
-      regla de las 02:00 lo devuelve al día anterior.
+    Cierre de sesiones: una sesión sin end_time se cierra con el INICIO del
+    siguiente evento del mismo rider (así no se pierden sus horas). Sesiones
+    absurdas (>18h, error de datos) se descartan.
 
-    ★ v2.2: fecha_min recorta a la ventana que de verdad se usa (con margen),
-    en vez de ordenar y agrupar todo el histórico de sesiones.
+    horas_conn se usa como respaldo: si el online_hours del silver difiere
+    mucho de las horas reales (CSV incompleto), el ajuste usa horas_conn.
+
+    Una sesión que CRUZA las 02:00 cuenta solo la parte real antes del corte.
     """
     conn = bronze_conn.with_columns([
         pl.col('start_time').str.to_datetime(strict=False).alias('start_dt'),
         pl.col('end_time').str.to_datetime(strict=False).alias('end_dt'),
     ]).filter(pl.col('start_dt').is_not_null())
-    if fecha_min is not None:
-        conn = conn.filter(pl.col('start_dt') >= fecha_min)
 
+    # Cerrar sesiones sin end_time con el inicio del siguiente evento del rider
     conn = conn.sort(['courier_uuid', 'start_dt'])
     conn = conn.with_columns(
         pl.col('start_dt').shift(-1).over('courier_uuid').alias('next_start')
@@ -520,52 +483,34 @@ def reconstruct_connections(bronze_conn, fecha_min=None):
           .otherwise(pl.col('next_start')).alias('end_eff')
     )
 
+    # Solo estados de trabajo, con fin efectivo válido y posterior al inicio
     conn = conn.filter(
         pl.col('status').is_in(WORK_STATES) &
         pl.col('end_eff').is_not_null() &
         (pl.col('end_eff') > pl.col('start_dt'))
     )
-    # Descartar sesiones absurdas ANTES de partir (error de datos)
+
+    # Límite de las 02:00 del día de cada sesión (según start_dt)
     conn = conn.with_columns(
-        ((pl.col('end_eff') - pl.col('start_dt')).dt.total_seconds() / 3600).alias('dur_total_h')
-    ).filter(pl.col('dur_total_h') <= 18)
-
-    # --- ★ FIX v2.1: partir cada sesión en la medianoche ---
-    # medianoche = las 00:00 del día siguiente al inicio de la sesión.
-    # Con sesiones de ≤18h, como mucho cruzan UNA medianoche.
-    medianoche = pl.col('start_dt').dt.truncate('1d').dt.offset_by('1d')
-    # Trozo 1: desde el inicio hasta la medianoche (o el fin, lo que llegue antes)
-    p1 = conn.with_columns([
-        pl.col('start_dt').alias('seg_s'),
-        pl.min_horizontal(pl.col('end_eff'), medianoche).alias('seg_e'),
-    ])
-    # Trozo 2: desde la medianoche hasta el fin (solo si la sesión la cruza)
-    p2 = conn.filter(pl.col('end_eff') > medianoche).with_columns([
-        medianoche.alias('seg_s'),
-        pl.col('end_eff').alias('seg_e'),
-    ])
-    segs = pl.concat([
-        p1.select(['courier_uuid', 'seg_s', 'seg_e']),
-        p2.select(['courier_uuid', 'seg_s', 'seg_e']),
-    ]).filter(pl.col('seg_e') > pl.col('seg_s'))
-
-    # Cada trozo pertenece al día calendario en que ocurre; su madrugada es
-    # lo que caiga entre las 00:00 y las 02:00 de ESE día.
-    corte_02h = pl.col('seg_s').dt.truncate('1d').dt.offset_by(f'{LOGICAL_DAY_CUTOFF_HOUR}h')
-    segs = segs.with_columns([
-        pl.col('seg_s').dt.date().alias('fecha_real'),
-        ((pl.col('seg_e') - pl.col('seg_s')).dt.total_seconds() / 3600).alias('dur_h'),
-        pl.when(pl.col('seg_s') < corte_02h)
+        pl.col('start_dt').dt.truncate('1d').dt.offset_by(f'{LOGICAL_DAY_CUTOFF_HOUR}h').alias('corte_02h')
+    )
+    conn = conn.with_columns([
+        pl.col('start_dt').dt.date().alias('fecha_real'),
+        ((pl.col('end_eff') - pl.col('start_dt')).dt.total_seconds() / 3600).alias('dur_h'),
+        # Parte real antes de las 02:00 (solo si la sesión empieza antes del corte):
+        pl.when(pl.col('start_dt') < pl.col('corte_02h'))
           .then(
-              (pl.min_horizontal(pl.col('seg_e'), corte_02h) - pl.col('seg_s'))
+              (pl.min_horizontal(pl.col('end_eff'), pl.col('corte_02h')) - pl.col('start_dt'))
               .dt.total_seconds() / 3600
           )
           .otherwise(0.0).alias('dur_madrugada'),
     ])
-    segs = segs.with_columns(pl.col('dur_madrugada').clip(lower_bound=0.0))
+    # Descartar sesiones absurdas (error de datos) y madrugada negativa
+    conn = conn.filter(pl.col('dur_h') <= 18)
+    conn = conn.with_columns(pl.col('dur_madrugada').clip(lower_bound=0.0))
 
     g = (
-        segs.group_by(['courier_uuid', 'fecha_real']).agg([
+        conn.group_by(['courier_uuid', 'fecha_real']).agg([
             pl.col('dur_h').sum().alias('horas_conn'),
             pl.col('dur_madrugada').sum().alias('horas_madrugada'),
         ])
@@ -581,13 +526,30 @@ def reconstruct_connections(bronze_conn, fecha_min=None):
 
 def apply_adjustment(silver, rta, conn):
     """
-    Modelo PROPORCIONAL sobre el SILVER (regla 02:00). [Lógica igual que v2.0]
+    Modelo PROPORCIONAL sobre el SILVER (regla 02:00).
 
-    ★ FIX v2.1: lo que se mueve a D-1 ya no se pierde si el rider no tiene
-    fila en D-1 (join 'full' en lugar de 'left' + creación de la fila).
+    El SILVER manda en TODOS los totales (num_of_trips, accept, cancel, horas)
+    porque ya viene correcto de Uber. Lo único que hacemos es MOVER la parte
+    de madrugada (< 02:00) de cada día al día anterior.
+
+    La fracción de madrugada se calcula con timestamps reales:
+      - PEDIDOS (viajes, accept, cancel) → fracción de RTA (frac_rta)
+      - HORAS (online_hours, p2, p3, etc.) → fracción de Connections (frac_horas)
+
+    Para cada (rider, día D):
+      mover_pedidos = total_silver(D) * frac_rta(D)   → de D a D-1
+      mover_horas   = horas_silver(D) * frac_horas(D) → de D a D-1
+    Si un día no tiene RTA/Connections, su fracción es 0 → no se mueve nada.
+
+    Pedidos/viajes: enteros (round). Horas: decimal.
+    % aceptación/cancelación: se recalculan con los totales ya movidos,
+    usando las fórmulas oficiales del silver:
+      % Aceptación  = accept / (accept + reject)
+      % Cancelación = cancel / accept
     """
     silver = silver.with_columns(pl.col('datestr').dt.date().alias('_dia'))
 
+    # --- Unir fracciones de RTA y Connections al silver por (uuid, día) ---
     s = silver
     if rta is not None and len(rta) > 0:
         s = s.join(rta.select(['courier_uuid', 'dia', 'frac_rta', 'rta_madrugada']),
@@ -607,6 +569,10 @@ def apply_adjustment(silver, rta, conn):
     ])
 
     # --- Corrección de horas incompletas del silver (Opción B) ---
+    # El online_hours del CSV de Uber a veces llega incompleto (el día no se
+    # había consolidado al exportar). Si Connections difiere en más de 1 hora,
+    # usamos las horas de Connections (que coinciden con el panel de Uber).
+    # El 95% de los días coinciden, así que esto solo corrige el ~4% problemático.
     if 'horas_conn' in s.columns and 'online_hours' in s.columns:
         s = s.with_columns(
             pl.when(
@@ -618,14 +584,24 @@ def apply_adjustment(silver, rta, conn):
             .alias('online_hours')
         )
 
+    # Columnas de PEDIDOS y de HORAS — TODO se mueve con la MISMA fracción
+    # (frac_horas de Connections), para que viajes y horas viajen JUNTOS y el
+    # TPH quede coherente. Si frac_horas = 0 (no hubo madrugada confirmada por
+    # Connections), no se mueve NADA y el día conserva sus totales de Uber.
     PEDIDO_COLS = [c for c in ['num_of_trips', 'single_trips_total', 'accept_trips',
                                'reject_trips', 'cancel_trips', 'cancel_not_at_fault_trips',
                                'late_p2_trips', 'late_p3_trips'] if c in s.columns]
     HORA_COLS = [c for c in ['online_hours', 'active_hours', 'open_hours',
                              'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours',
                              'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min'] if c in s.columns]
-    MOVE_COLS = PEDIDO_COLS + HORA_COLS
 
+    # --- Cantidad que se mueve al día anterior ---
+    # Connections es la fuente ÚNICA de la madrugada (mide horas Y actividad con
+    # timestamps reales). RTA a veces no registra los pedidos de madrugada aunque
+    # el rider estuviera trabajando, así que usar RTA descuadraba (movía horas
+    # sin mover viajes). Con una sola fracción, viajes y horas se mueven juntos.
+    #   - HORAS: proporción exacta (decimal)
+    #   - PEDIDOS: proporción redondeada al entero (no hay medios viajes)
     mv_exprs = []
     for c in PEDIDO_COLS:
         mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_horas')).round(0).alias('mv_' + c))
@@ -633,52 +609,27 @@ def apply_adjustment(silver, rta, conn):
         mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_horas')).alias('mv_' + c))
     s = s.with_columns(mv_exprs)
 
-    # --- Lo que entra en D-1 ---
+    # --- Construir los movimientos (lo que entra en D-1) ---
+    move_cols = ['mv_' + c for c in PEDIDO_COLS + HORA_COLS]
     movidos = s.select(
         ['driver_uuid'] +
         [(pl.col('_dia') - pl.duration(days=1)).alias('_dia')] +
-        [pl.col('mv_' + c).alias('in_' + c) for c in MOVE_COLS]
+        [pl.col('mv_' + c).alias('in_' + c) for c in PEDIDO_COLS + HORA_COLS]
     )
     movidos = movidos.group_by(['driver_uuid', '_dia']).agg(
-        [pl.col('in_' + c).sum() for c in MOVE_COLS]
-    )
-    # No arrastrar movimientos vacíos (evita crear filas fantasma en el full join)
-    movidos = movidos.filter(
-        pl.sum_horizontal([pl.col('in_' + c).abs() for c in MOVE_COLS]) > 0
+        [pl.col('in_' + c).sum() for c in PEDIDO_COLS + HORA_COLS]
     )
 
-    # --- Restar de cada día lo que sale ---
+    # --- Restar de cada día lo que sale, sumar lo que entra ---
+    # Primero restamos
     s = s.with_columns(
-        [(pl.col(c).fill_null(0) - pl.col('mv_' + c)).alias(c) for c in MOVE_COLS]
+        [(pl.col(c).fill_null(0) - pl.col('mv_' + c)).alias(c) for c in PEDIDO_COLS + HORA_COLS]
     )
-
-    # --- ★ FIX v2.1: unir lo que entra con join FULL (antes 'left') ---
-    # Con 'left', si el rider no tenía fila en D-1 (p. ej. SOLO trabajó de
-    # madrugada el día D), los viajes/horas movidos desaparecían.
-    # Con 'full' + coalesce, esa fila se crea y no se pierde nada.
-    s = s.join(movidos, on=['driver_uuid', '_dia'], how='full', coalesce=True)
-
-    # Filas nuevas (solo entrantes): métricas a 0 antes de sumar lo que entra
-    s = s.with_columns([pl.col(c).fill_null(0.0) for c in MOVE_COLS])
+    # Unimos lo que entra del día siguiente
+    s = s.join(movidos, on=['driver_uuid', '_dia'], how='left')
     s = s.with_columns(
-        [(pl.col(c) + pl.col('in_' + c).fill_null(0)).alias(c) for c in MOVE_COLS]
+        [(pl.col(c) + pl.col('in_' + c).fill_null(0)).alias(c) for c in PEDIDO_COLS + HORA_COLS]
     )
-    # Completar datestr y fracciones en las filas creadas por el full join
-    s = s.with_columns([
-        pl.when(pl.col('datestr').is_null())
-          .then(pl.col('_dia').cast(pl.Datetime('us')))
-          .otherwise(pl.col('datestr')).alias('datestr'),
-        pl.col('frac_horas').fill_null(0.0),
-        pl.col('frac_rta').fill_null(0.0),
-    ])
-    # Rellenar metadatos del rider (nombre, email...) en las filas creadas,
-    # copiándolos de otra fila del mismo rider.
-    META_COLS = [c for c in ['driver_name', 'driver_number', 'driver_email',
-                             'fleet_name', 'city_id', 'city_name', 'market_name',
-                             'form_factor', 'weekstr'] if c in s.columns]
-    s = s.with_columns([
-        pl.col(c).fill_null(pl.col(c).max().over('driver_uuid')) for c in META_COLS
-    ])
 
     # --- Recalcular métricas derivadas con los totales ya movidos ---
     s = s.with_columns([
@@ -699,6 +650,8 @@ def apply_adjustment(silver, rta, conn):
               .otherwise(0.0).alias('pct_cancelacion')
         )
 
+    # Marcar si la fila tuvo movimiento de madrugada (frac_horas > 0) o recibió
+    # algo del día siguiente. Sirve para inspección en el dashboard.
     s = s.with_columns([
         ((pl.col('frac_horas') > 0) |
          pl.col('in_num_of_trips').is_not_null()).alias('ajustado_connections'),
@@ -706,64 +659,127 @@ def apply_adjustment(silver, rta, conn):
         pl.col('frac_rta').alias('_frac_rta_dbg'),
     ])
 
-    aux = ['frac_rta', 'frac_horas', 'rta_madrugada', 'horas_conn'] + \
-          ['mv_' + c for c in MOVE_COLS] + ['in_' + c for c in MOVE_COLS]
+    # Limpiar auxiliares
+    aux = ['frac_rta', 'frac_horas', 'rta_madrugada', 'horas_conn'] + ['mv_' + c for c in PEDIDO_COLS + HORA_COLS] + \
+          ['in_' + c for c in PEDIDO_COLS + HORA_COLS]
     s = s.drop([c for c in aux if c in s.columns])
     return s
 
 
 # =============================================================================
-# 5. MAIN  [SIN CAMBIOS salvo versión]
+# 4.5. SINCRONIZACIÓN CON SUPABASE (reemplaza a la antigua API Fleet Manager)
+# =============================================================================
+# Se llama UNA vez, al final de main(), después de escribir el parquet.
+# No recalcula nada — solo renombra columnas y ajusta unidades para que
+# coincidan con lo que espera la tabla driver_daily_stats, y sube el
+# resultado con upsert (courier_uuid, day).
+
+_RENOMBRAR_SUPABASE = {
+    'driver_uuid': 'courier_uuid',
+    'driver_email': 'email',
+    'city_name': 'city',
+    'cancel_not_at_fault_trips': 'cancel_not_at_fault',
+    'tph_adj': 'tph',
+}
+
+_COLUMNAS_DESTINO_SUPABASE = [
+    'day', 'courier_uuid', 'driver_name', 'driver_number', 'email', 'city',
+    'flow_type', 'num_of_trips', 'online_hours', 'active_hours',
+    'accept_trips', 'reject_trips', 'cancel_trips', 'cancel_not_at_fault',
+    'tph', 'pct_accept', 'pct_cancel',
+]
+
+
+def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = 21) -> None:
+    """
+    Sube a Supabase solo la ventana reciente (por defecto 21 dias, igual
+    que REPROCESS_WEEKS*7). El UPSERT por (courier_uuid, day) cubre que
+    los dias de la ventana se sobrescriban con el dato mas reciente.
+    """
+    df = final.clone()
+
+    if '_dia' in df.columns:
+        df = df.rename({'_dia': 'day'})
+    elif 'datestr' in df.columns:
+        df = df.with_columns(pl.col('datestr').dt.date().alias('day'))
+
+    for col_faltante in ('pct_aceptacion', 'pct_cancelacion', 'tph_adj', 'flow_type'):
+        if col_faltante not in df.columns:
+            df = df.with_columns(pl.lit(0.0 if col_faltante != 'flow_type' else None).alias(col_faltante))
+
+    df = df.rename({k: v for k, v in _RENOMBRAR_SUPABASE.items() if k in df.columns})
+
+    df = df.with_columns([
+        (pl.col('pct_aceptacion') / 100.0).alias('pct_accept'),
+        (pl.col('pct_cancelacion') / 100.0).alias('pct_cancel'),
+    ])
+
+    for col in _COLUMNAS_DESTINO_SUPABASE:
+        if col not in df.columns:
+            df = df.with_columns(pl.lit(None).alias(col))
+    df = df.select(_COLUMNAS_DESTINO_SUPABASE)
+
+    if 'day' in df.columns:
+        limite = date.today() - timedelta(days=ventana_dias)
+        df = df.filter(pl.col('day') >= limite)
+
+    registros = df.with_columns(pl.col('day').cast(pl.Utf8)).to_dicts()
+    if not registros:
+        print('[sync_to_supabase] Nada que sincronizar en la ventana reciente.')
+        return
+
+    supabase = create_client(os.environ['SUPABASE_METRICS_URL'], os.environ['SUPABASE_METRICS_SERVICE_KEY'])
+    TAMANO_LOTE = 500
+    subidos = 0
+    for i in range(0, len(registros), TAMANO_LOTE):
+        lote = registros[i:i + TAMANO_LOTE]
+        supabase.table('driver_daily_stats').upsert(lote, on_conflict='courier_uuid,day').execute()
+        subidos += len(lote)
+        print(f'[sync_to_supabase] {subidos}/{len(registros)} filas sincronizadas')
+
+    print(f'[sync_to_supabase] {subidos} filas sincronizadas a Supabase (ventana: ultimos {ventana_dias} dias)')
+
+
+# =============================================================================
+# 5. MAIN
 # =============================================================================
 
 def main():
-    marca("Inicio")
+    # --- Bronze ---
     bronze_daily = ingest_bronze_daily()
-    marca("Ingesta COURIER_DAILY lista")
     if bronze_daily is None:
         print("\n✗ No hay datos de COURIER_DAILY. Abortando.")
         return
     bronze_conn = ingest_bronze_connections()
-    marca("Ingesta CONNECTIONS lista")
     bronze_rta  = ingest_bronze_rta()
-    marca("Ingesta RTA lista")
 
+    # --- Silver ---
     print("\n--- Construyendo silver ---")
+    # Diagnóstico: cuántas filas del bronce, cuántas tras dedup+suma
     n_bronze = len(bronze_daily)
     silver = build_silver(bronze_daily)
-    marca("Silver construido")
     print(f"[silver] Bronze daily: {n_bronze:,} filas → silver: {len(silver):,} filas (rider+día únicos)")
-
-    # ★ v2.2: ventana con margen para recortar Connections/RTA (la madrugada
-    # del primer día de la ventana puede venir de sesiones del día anterior)
-    ventana_min = silver.select(pl.col('datestr').min()).item()
-    fecha_min = (ventana_min - timedelta(days=2)) if ventana_min is not None else None
+    # Aviso si quedan duplicados (no debería)
     _dup = (silver.with_columns(pl.col('datestr').dt.date().alias('_d'))
                   .group_by(['driver_uuid', '_d']).agg(pl.len().alias('n'))
                   .filter(pl.col('n') > 1))
     if len(_dup) > 0:
         print(f"[silver] ⚠ ADVERTENCIA: {len(_dup)} (rider,día) con más de una fila tras el silver")
 
+    # --- Reconstrucción de cada fuente por día lógico ---
     recon_conn = None
     if bronze_conn is not None and len(bronze_conn) > 0:
-        recon_conn = reconstruct_connections(bronze_conn, fecha_min)
-        marca("Connections reconstruido")
+        recon_conn = reconstruct_connections(bronze_conn)
         print(f"[conn] Reconstrucción: {len(recon_conn):,} combinaciones (rider, día)")
 
     recon_rta = None
     if bronze_rta is not None and len(bronze_rta) > 0:
-        recon_rta = reconstruct_rta(bronze_rta, fecha_min)
-        marca("RTA reconstruido")
+        recon_rta = reconstruct_rta(bronze_rta)
         print(f"[rta] Reconstrucción: {len(recon_rta):,} combinaciones (rider, día)")
 
+    # --- Ajuste proporcional sobre el silver (regla 02:00) ---
     if recon_conn is not None or recon_rta is not None:
         final = apply_adjustment(silver, recon_rta, recon_conn)
-        marca("Ajuste 02:00 aplicado")
-        # El full join puede crear una fila justo ANTES de la ventana
-        # (madrugada del primer día movida al día anterior): la quitamos
-        # para que el parquet cubra exactamente la ventana.
-        if ventana_min is not None:
-            final = final.filter(pl.col('datestr') >= ventana_min)
         n_mov = final.filter(pl.col('ajustado_connections')).height
         print(f"[ajuste] Filas con movimiento de madrugada: {n_mov:,} / {len(final):,}")
     else:
@@ -776,7 +792,10 @@ def main():
             pl.lit(0.0).alias('_frac_rta_dbg'),
             pl.lit(0.0).alias('_frac_horas_dbg'),
         ])
+        if '_dia' in final.columns:
+            final = final.drop('_dia')
 
+    # --- Quitar filas de días vacíos (0 viajes Y 0 horas) ---
     antes = len(final)
     final = final.filter(
         ~((pl.col('num_of_trips').fill_null(0) == 0) &
@@ -786,10 +805,18 @@ def main():
     if quitadas > 0:
         print(f"[limpieza] Filas vacías eliminadas (0 viajes y 0 horas): {quitadas}")
 
+    # --- Salida: SOLO el parquet (lo que lee la app). Sin CSV ni dashboard. ---
     final.write_parquet(SILVER_PARQUET, compression='zstd')
-    marca(f"Parquet final escrito")
     print(f"\n✓ Parquet final: {SILVER_PARQUET} ({len(final):,} filas)")
 
+    # --- Sincronizar el resultado a Supabase (reemplaza a la API Fleet Manager) ---
+    sync_to_supabase(final)
+
+    # NOTA: el pipeline NO genera dashboard.html. El dashboard de producción
+    # es la app React (Closer CRM), que lee las métricas desde Supabase,
+    # no del parquet directamente.
+
+    # --- Chequeo de integridad: una sola fila por (rider, día) ---
     dups = (final.with_columns(pl.col('datestr').dt.date().alias('_d'))
                  .group_by(['driver_uuid', '_d']).agg(pl.len().alias('n'))
                  .filter(pl.col('n') > 1))
