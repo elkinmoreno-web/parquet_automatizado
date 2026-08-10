@@ -231,21 +231,41 @@ def ingest_bronze_connections():
     nuevos = [f for f in files if f['name'] not in processed]
     print(f"[conn] Archivos nuevos a procesar: {len(nuevos)}")
 
-    new_dfs = []
+    # Concatenación INCREMENTAL por lotes: con cientos de CSV grandes, guardar
+    # los 118+ DataFrames sueltos en una lista y concatenarlos TODOS de golpe
+    # al final crea un pico de memoria enorme (lista completa + copia
+    # concatenada + bronze anterior, coexistiendo a la vez) — en el runner de
+    # GitHub Actions (7 GB de RAM) esto agotaba la memoria y el proceso era
+    # cancelado por el sistema (SIGTERM, exit code 143). Concatenando de a
+    # LOTE_TAMANO archivos, nunca hay más que un puñado de DataFrames sueltos
+    # en memoria a la vez — el resultado final es idéntico, solo cambia cómo
+    # se llega a él.
+    LOTE_TAMANO = 15
+    acumulado = existing
+    lote_actual = []
+
+    def volcar_lote():
+        nonlocal acumulado, lote_actual
+        if not lote_actual:
+            return
+        concat_lote = pl.concat(lote_actual, how='vertical_relaxed')
+        acumulado = concat_lote if acumulado is None else pl.concat([acumulado, concat_lote], how='vertical_relaxed')
+        lote_actual = []
+
     for i, f in enumerate(nuevos, 1):
         try:
             df = parse_conn_csv(f['path'], f['name'])
-            new_dfs.append(df)
+            lote_actual.append(df)
             print(f"  [{i}/{len(nuevos)}] {f['name']}: {len(df):,} filas")
         except Exception as e:
             print(f"  [{i}/{len(nuevos)}] {f['name']}: ERROR {e}")
+        if len(lote_actual) >= LOTE_TAMANO:
+            volcar_lote()
+    volcar_lote()
 
-    parts = []
-    if existing is not None: parts.append(existing)
-    if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
-    if not parts:
+    if acumulado is None:
         return None
-    bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
+    bronze = acumulado
 
     # Dedup incremental: (courier_uuid, start_time, status) — los archivos pueden solapar
     before = len(bronze)
@@ -298,20 +318,34 @@ def ingest_bronze_rta():
     nuevos = [f for f in files if f['name'] not in processed]
     print(f"[rta] Archivos nuevos a procesar: {len(nuevos)}")
 
-    new_dfs = []
+    # Mismo arreglo que en ingest_bronze_connections (ver ese comentario para
+    # el detalle completo): esta es la función que históricamente más pesaba,
+    # con miles de archivos CSV pequeños de golpe.
+    LOTE_TAMANO = 50
+    acumulado_rta = existing
+    lote_actual_rta = []
+
+    def volcar_lote_rta():
+        nonlocal acumulado_rta, lote_actual_rta
+        if not lote_actual_rta:
+            return
+        concat_lote = pl.concat(lote_actual_rta, how='vertical_relaxed')
+        acumulado_rta = concat_lote if acumulado_rta is None else pl.concat([acumulado_rta, concat_lote], how='vertical_relaxed')
+        lote_actual_rta = []
+
     for i, f in enumerate(nuevos, 1):
         try:
             df = parse_rta_csv(f['path'], f['name'])
-            new_dfs.append(df)
+            lote_actual_rta.append(df)
         except Exception as e:
             print(f"  [{i}/{len(nuevos)}] {f['name']}: ERROR {e}")
+        if len(lote_actual_rta) >= LOTE_TAMANO:
+            volcar_lote_rta()
+    volcar_lote_rta()
 
-    parts = []
-    if existing is not None: parts.append(existing)
-    if new_dfs:              parts.append(pl.concat(new_dfs, how='vertical_relaxed'))
-    if not parts:
+    if acumulado_rta is None:
         return None
-    bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
+    bronze = acumulado_rta
 
     # Dedup incremental por offer_id (cada pedido es único; archivos solapan)
     before = len(bronze)
