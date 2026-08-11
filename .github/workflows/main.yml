@@ -42,19 +42,19 @@ jobs:
         run: |
           rclone copy "gdrive:" COURIER_DAILY/ \
             --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY \
-            --transfers 32 --checkers 32 --fast-list --max-age 15d -v
+            --transfers 32 --checkers 32 --fast-list --max-age 5d -v
 
       - name: Descargar CONNECTIONS (reciente)
         run: |
           rclone copy "gdrive:" CONNECTIONS/ \
             --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 \
-            --transfers 32 --checkers 32 --fast-list --max-age 15d -v
+            --transfers 32 --checkers 32 --fast-list --max-age 5d -v
 
       - name: Descargar CANCELLATIONS_RTA (reciente)
         run: |
           rclone copy "gdrive:" CANCELLATIONS_RTA/ \
             --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u \
-            --transfers 32 --checkers 32 --fast-list --max-age 15d -v
+            --transfers 32 --checkers 32 --fast-list --max-age 5d -v
 
       - name: Configurar Python
         uses: actions/setup-python@v5
