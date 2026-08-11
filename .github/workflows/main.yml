@@ -48,7 +48,7 @@ jobs:
         run: |
           rclone copy "gdrive:" CONNECTIONS/ \
             --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 \
-            --transfers 32 --checkers 32 --fast-list --max-age 5d -v
+            --transfers 32 --checkers 32 --fast-list --max-age 2d -v
 
       - name: Descargar CANCELLATIONS_RTA (reciente)
         run: |
