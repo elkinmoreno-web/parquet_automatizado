@@ -1,4 +1,4 @@
-name: Pipeline Producción (riders)
+name: Pipeline Producción (riders) V2.0
 
 on:
   schedule:
