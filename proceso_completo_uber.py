@@ -9,7 +9,7 @@ VERSIÓN: v2.0-connections-only  (2026-06-02)
   Días sin cobertura de Connections se descartan.
 """
 
-PIPELINE_VERSION = "v5.0-silver-movido-02h"
+PIPELINE_VERSION = "v5.1-bronce-podado"
 
 import os
 import io
@@ -52,6 +52,16 @@ SILVER_PARQUET = os.path.join(OUTPUT_DIR, SILVER_NAME + '.parquet')
 # 3 semanas cubre la regla de 2 semanas del dashboard + margen.
 REPROCESS_WEEKS = 3
 
+# Cuántos días de histórico se conservan en los bronze.
+# Antes NO se borraba nada: el parquet crecía indefinidamente, y con él la
+# memoria del runner (de ahí los SIGTERM / exit 143), el tiempo de dedup y
+# sobre todo el de subida a Drive (llegó a 3m54s, el 41% del run).
+# Es seguro podar porque el silver solo usa REPROCESS_WEEKS (3 semanas) y las
+# descargas traen --max-age 3d.
+# NO bajar de ~15 días: el registro de ficheros ya procesados (dedup) se
+# deriva de las filas guardadas, y debe cubrir de sobra la ventana de descarga.
+BRONZE_RETENTION_DAYS = int(os.environ.get('BRONZE_RETENTION_DAYS', '60'))
+
 # Hora de corte del día lógico (registros antes de esto → día anterior)
 LOGICAL_DAY_CUTOFF_HOUR = 2
 
@@ -85,6 +95,47 @@ def detect_sep(path):
     with open(path, 'r', encoding='utf-8', errors='replace') as f:
         first = f.readline()
     return '\t' if first.count('\t') > first.count(',') else ','
+
+
+def podar_bronze(df, columna_fecha, etiqueta):
+    """
+    Recorta el bronze a los últimos BRONZE_RETENTION_DAYS.
+
+    Sin esto el parquet crece para siempre: cada ejecución lo lee entero, le
+    añade lo nuevo y lo reescribe completo, así que el coste de memoria, de
+    dedup y de subida a Drive sube semana a semana sin tope.
+    """
+    if df is None or len(df) == 0 or columna_fecha not in df.columns:
+        return df
+
+    limite = datetime.now() - timedelta(days=BRONZE_RETENTION_DAYS)
+    ts = pl.col(columna_fecha)
+    if df.schema[columna_fecha] == pl.Utf8:
+        ts = ts.str.to_datetime(strict=False)
+
+    antes = len(df)
+    # Las filas con fecha ilegible se CONSERVAN: preferimos guardar de más
+    # antes que tirar datos por un formato inesperado.
+    df = df.filter(ts.is_null() | (ts >= limite))
+    if antes != len(df):
+        print(f"[{etiqueta}] Poda a {BRONZE_RETENTION_DAYS} días: {antes:,} → {len(df):,} filas")
+    return df
+
+
+def avisar_errores(etiqueta, errores, total):
+    """
+    Un CSV corrupto no debe pasar desapercibido: antes solo se imprimía el
+    error y el run terminaba en verde con datos incompletos, que es el peor
+    de los fallos posibles (nadie se entera hasta que faltan riders).
+    """
+    if not errores:
+        return
+    print(f"[{etiqueta}] ⚠ {errores}/{total} ficheros fallaron al parsear")
+    if total and errores > total / 2:
+        raise RuntimeError(
+            f"[{etiqueta}] Demasiados ficheros corruptos ({errores}/{total}): "
+            "se aborta para no publicar datos incompletos"
+        )
 
 
 # =============================================================================
@@ -162,13 +213,27 @@ def ingest_bronze_daily():
     print(f"[daily] Archivos nuevos a procesar: {len(nuevos)}")
 
     new_dfs = []
+    errores = 0
     for i, f in enumerate(nuevos, 1):
         try:
             df = parse_daily_csv(f['path'], f['name'], f['ts'])
             new_dfs.append(df)
             print(f"  [{i}/{len(nuevos)}] {f['name']}: {len(df):,} filas")
         except Exception as e:
+            errores += 1
             print(f"  [{i}/{len(nuevos)}] {f['name']}: ERROR {e}")
+    avisar_errores('daily', errores, len(nuevos))
+
+    # Si no hay nada nuevo Y no hay nada que podar, NO se reescribe el parquet:
+    # así conserva su fecha de modificación y rclone se salta la subida a Drive.
+    if not new_dfs and existing is not None:
+        podado = podar_bronze(existing, 'datestr', 'daily')
+        if len(podado) == len(existing):
+            print("[daily] Sin archivos nuevos ni poda pendiente — no se reescribe el parquet")
+            return existing
+        podado.write_parquet(BRONZE_DAILY_PARQUET, compression='zstd')
+        print(f"[daily] Bronze guardado (solo poda): {len(podado):,} filas")
+        return podado
 
     parts = []
     if existing is not None: parts.append(existing)
@@ -176,6 +241,7 @@ def ingest_bronze_daily():
     if not parts:
         return None
     bronze = pl.concat(parts, how='vertical_relaxed') if len(parts) > 1 else parts[0]
+    bronze = podar_bronze(bronze, 'datestr', 'daily')
     bronze.write_parquet(BRONZE_DAILY_PARQUET, compression='zstd')
     print(f"[daily] Bronze guardado: {len(bronze):,} filas")
     return bronze
@@ -252,16 +318,19 @@ def ingest_bronze_connections():
         acumulado = concat_lote if acumulado is None else pl.concat([acumulado, concat_lote], how='vertical_relaxed')
         lote_actual = []
 
+    errores = 0
     for i, f in enumerate(nuevos, 1):
         try:
             df = parse_conn_csv(f['path'], f['name'])
             lote_actual.append(df)
             print(f"  [{i}/{len(nuevos)}] {f['name']}: {len(df):,} filas")
         except Exception as e:
+            errores += 1
             print(f"  [{i}/{len(nuevos)}] {f['name']}: ERROR {e}")
         if len(lote_actual) >= LOTE_TAMANO:
             volcar_lote()
     volcar_lote()
+    avisar_errores('conn', errores, len(nuevos))
 
     if acumulado is None:
         return None
@@ -272,6 +341,7 @@ def ingest_bronze_connections():
     bronze = bronze.unique(subset=['courier_uuid', 'start_time', 'status'], keep='first')
     print(f"[conn] Dedup: {before:,} → {len(bronze):,} filas")
 
+    bronze = podar_bronze(bronze, 'start_time', 'conn')
     bronze.write_parquet(BRONZE_CONN_PARQUET, compression='zstd')
     print(f"[conn] Bronze guardado: {len(bronze):,} filas")
     return bronze
@@ -333,15 +403,18 @@ def ingest_bronze_rta():
         acumulado_rta = concat_lote if acumulado_rta is None else pl.concat([acumulado_rta, concat_lote], how='vertical_relaxed')
         lote_actual_rta = []
 
+    errores = 0
     for i, f in enumerate(nuevos, 1):
         try:
             df = parse_rta_csv(f['path'], f['name'])
             lote_actual_rta.append(df)
         except Exception as e:
+            errores += 1
             print(f"  [{i}/{len(nuevos)}] {f['name']}: ERROR {e}")
         if len(lote_actual_rta) >= LOTE_TAMANO:
             volcar_lote_rta()
     volcar_lote_rta()
+    avisar_errores('rta', errores, len(nuevos))
 
     if acumulado_rta is None:
         return None
@@ -352,6 +425,7 @@ def ingest_bronze_rta():
     bronze = bronze.unique(subset=['offer_id'], keep='first')
     print(f"[rta] Dedup por offer_id: {before:,} → {len(bronze):,} filas")
 
+    bronze = podar_bronze(bronze, 'timestamp', 'rta')
     bronze.write_parquet(BRONZE_RTA_PARQUET, compression='zstd')
     print(f"[rta] Bronze guardado: {len(bronze):,} filas")
     return bronze
@@ -496,6 +570,11 @@ def reconstruct_connections(bronze_conn):
     Cierre de sesiones: una sesión sin end_time se cierra con el INICIO del
     siguiente evento del mismo rider (así no se pierden sus horas). Sesiones
     absurdas (>18h, error de datos) se descartan.
+
+    OJO: la ÚLTIMA sesión de cada rider no tiene evento siguiente, así que su
+    end_eff queda nulo y se descarta. Por eso el día en curso siempre entra
+    algo corto y se completa en la exportación siguiente — tenlo en cuenta si
+    algún día bajas el colchón de 2 días del dashboard.
 
     horas_conn se usa como respaldo: si el online_hours del silver difiere
     mucho de las horas reales (CSV incompleto), el ajuste usa horas_conn.
@@ -724,12 +803,22 @@ _COLUMNAS_DESTINO_SUPABASE = [
 ]
 
 
-def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = 21) -> None:
+def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
     """
-    Sube a Supabase solo la ventana reciente (por defecto 21 dias, igual
-    que REPROCESS_WEEKS*7). El UPSERT por (courier_uuid, day) cubre que
-    los dias de la ventana se sobrescriban con el dato mas reciente.
+    Sube a Supabase solo la ventana reciente. El UPSERT por (courier_uuid, day)
+    cubre que los días de la ventana se sobrescriban con el dato más reciente.
+
+    La ventana por defecto son 7 días, no 21: las descargas traen --max-age 3d,
+    así que más allá de ~4 días NADA puede haber cambiado. Subir 21 días en
+    cada una de las 4 ejecuciones diarias eran ~59.000 filas (~118 peticiones)
+    para modificar unas pocas miles — y además el runner está en EE. UU. y la
+    base en Irlanda, con lo que cada petición cruza el Atlántico.
+
+    Para un rebackfill completo: SUPABASE_SYNC_DAYS=21 (o más) al lanzarlo.
     """
+    if ventana_dias is None:
+        ventana_dias = int(os.environ.get('SUPABASE_SYNC_DAYS', '7'))
+
     df = final.clone()
 
     if '_dia' in df.columns:
@@ -763,7 +852,9 @@ def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = 21) -> None:
         return
 
     supabase = create_client(os.environ['SUPABASE_METRICS_URL'], os.environ['SUPABASE_METRICS_SERVICE_KEY'])
-    TAMANO_LOTE = 500
+    # 1000 filas por petición (~250 KB): la mitad de viajes de ida y vuelta a
+    # Irlanda que con lotes de 500, muy por debajo del límite de tamaño.
+    TAMANO_LOTE = 1000
     subidos = 0
     for i in range(0, len(registros), TAMANO_LOTE):
         lote = registros[i:i + TAMANO_LOTE]
@@ -846,9 +937,7 @@ def main():
     # --- Sincronizar el resultado a Supabase (reemplaza a la API Fleet Manager) ---
     sync_to_supabase(final)
 
-    # NOTA: el pipeline NO genera dashboard.html. El dashboard de producción
-    # es la app React (Closer CRM), que lee las métricas desde Supabase,
-    # no del parquet directamente.
+
 
     # --- Chequeo de integridad: una sola fila por (rider, día) ---
     dups = (final.with_columns(pl.col('datestr').dt.date().alias('_d'))
@@ -864,4 +953,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
