@@ -33,12 +33,13 @@ env:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    # Sin esto, un rclone colgado puede correr 6 horas y quemarte la cuota.
+    # Sin esto, un rclone colgado puede correr hasta 6 horas y quemar la cuota
+    # del plan gratis sin que nadie se entere.
     timeout-minutes: 30
 
     steps:
       # Deja escrita la hora REAL de arranque en el resumen del run: es la
-      # forma de medir cuánto se está desviando el cron de GitHub.
+      # forma de medir cuánto se desvía en la práctica el cron de GitHub.
       - name: Hora real de arranque
         run: echo "### Arranque · $(TZ=Europe/Madrid date '+%d/%m/%Y %H:%M:%S %Z')" >> "$GITHUB_STEP_SUMMARY"
 
@@ -81,9 +82,9 @@ jobs:
           bajar_csv CANCELLATIONS_RTA "$DRIVE_CANCELLATIONS" & pid_rta=$!
 
           # IMPORTANTE: 'wait PID' devuelve el estado real SOLO si lo último que
-          # ejecuta el proceso de fondo es el propio rclone. Por eso aquí se usan
-          # funciones y no subshells terminados en 'echo' (eso se tragaba los
-          # fallos y el pipeline seguía con datos incompletos).
+          # ejecuta el proceso de fondo es el propio rclone. Por eso se usan
+          # funciones y no subshells terminados en 'echo': eso último se tragaba
+          # los fallos y el pipeline seguía adelante con datos incompletos.
           wait $pid_bronce || echo "Sin bronce previo (primera ejecución) — se continúa"
 
           fallo=0
@@ -111,6 +112,9 @@ jobs:
         env:
           SUPABASE_METRICS_URL: ${{ secrets.SUPABASE_METRICS_URL }}
           SUPABASE_METRICS_SERVICE_KEY: ${{ secrets.SUPABASE_METRICS_SERVICE_KEY }}
+          # Solo se suben a Supabase los días que de verdad pueden haber
+          # cambiado (las descargas traen --max-age 3d). Para un rebackfill
+          # completo, lanza el workflow a mano y sube este número a 21.
           SUPABASE_SYNC_DAYS: '7'
 
       - name: Tamaño de la salida
