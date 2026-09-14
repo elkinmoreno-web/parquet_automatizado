@@ -2,59 +2,99 @@ name: Pipeline Producción (riders)
 
 on:
   schedule:
-    - cron: '13 */8 * * *'
+    # Minutos "raros" y unos minutos ANTES del objetivo: el retraso típico de
+    # GitHub deja la ejecución encima de la hora en vez de pasada. Se evitan
+    # :00 y :30, que son los minutos donde programa todo el mundo.
+    - cron: '33 8 * * *'     # objetivo 09:00
+      timezone: 'Europe/Madrid'
+    - cron: '03 12 * * *'    # objetivo 12:30
+      timezone: 'Europe/Madrid'
+    - cron: '03 15 * * *'    # objetivo 15:30
+      timezone: 'Europe/Madrid'
+    - cron: '03 19 * * *'    # objetivo 19:30
+      timezone: 'Europe/Madrid'
   workflow_dispatch:
+
+# Dos ejecuciones a la vez corromperían el bronce: las dos lo bajan, cada una
+# le añade cosas distintas, y la última en subir pisa el trabajo de la otra.
+concurrency:
+  group: pipeline-riders
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DRIVE_BRONZE:        1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_
+  DRIVE_COURIER:       1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY
+  DRIVE_CONNECTIONS:   14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1
+  DRIVE_CANCELLATIONS: 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
+    # Sin esto, un rclone colgado puede correr 6 horas y quemarte la cuota.
+    timeout-minutes: 30
 
     steps:
+      # Deja escrita la hora REAL de arranque en el resumen del run: es la
+      # forma de medir cuánto se está desviando el cron de GitHub.
+      - name: Hora real de arranque
+        run: echo "### Arranque · $(TZ=Europe/Madrid date '+%d/%m/%Y %H:%M:%S %Z')" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Descargar el código
         uses: actions/checkout@v4
 
-      - name: Instalar Rclone
+      - name: Instalar y configurar Rclone
         run: |
-          sudo apt-get update
-          sudo apt-get install -y rclone
-
-      - name: Configurar archivo de Rclone
-        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          rclone version | head -1
           mkdir -p ~/.config/rclone
           cat << 'EOF' > ~/.config/rclone/rclone.conf
           ${{ secrets.RCLONE_CONF }}
           EOF
 
       - name: Crear carpetas de trabajo
-        run: |
-          mkdir -p COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA datos_salida
+        run: mkdir -p COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA datos_salida
 
-      # 1. BAJAR EL BRONZE EXISTENTE (histórico). Si no existe, no falla.
-      - name: Bajar bronce existente desde Drive
+      - name: Bajar bronce y CSVs recientes en paralelo
+        shell: bash
         run: |
+          set -uo pipefail
+
+          bajar_csv () {
+            rclone copy "gdrive:" "$1/" \
+              --drive-root-folder-id "$2" \
+              --transfers 12 --checkers 12 --fast-list --max-age 3d \
+              --stats-one-line --stats 30s
+          }
+
+          # El bronce se baja a la vez que los CSV: no dependen entre sí.
           rclone copy "gdrive:" datos_salida/ \
-            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ \
+            --drive-root-folder-id "$DRIVE_BRONZE" \
             --include "bronze_*.parquet" \
-            --transfers 8 --checkers 8 -v || echo "Sin bronce previo (primera corrida)"
+            --transfers 4 --checkers 8 --stats-one-line --stats 30s & pid_bronce=$!
 
-      # 2. BAJAR SOLO CSVs RECIENTES (paralelo + últimos 25 días)
-      - name: Descargar COURIER_DAILY (reciente)
-        run: |
-          rclone copy "gdrive:" COURIER_DAILY/ \
-            --drive-root-folder-id 1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY \
-            --transfers 32 --checkers 32 --fast-list --max-age 3d -v
+          bajar_csv COURIER_DAILY     "$DRIVE_COURIER"       & pid_courier=$!
+          bajar_csv CONNECTIONS       "$DRIVE_CONNECTIONS"   & pid_conn=$!
+          bajar_csv CANCELLATIONS_RTA "$DRIVE_CANCELLATIONS" & pid_rta=$!
 
-      - name: Descargar CONNECTIONS (reciente)
-        run: |
-          rclone copy "gdrive:" CONNECTIONS/ \
-            --drive-root-folder-id 14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1 \
-            --transfers 32 --checkers 32 --fast-list --max-age 3d -v
+          # IMPORTANTE: 'wait PID' devuelve el estado real SOLO si lo último que
+          # ejecuta el proceso de fondo es el propio rclone. Por eso aquí se usan
+          # funciones y no subshells terminados en 'echo' (eso se tragaba los
+          # fallos y el pipeline seguía con datos incompletos).
+          wait $pid_bronce || echo "Sin bronce previo (primera ejecución) — se continúa"
 
-      - name: Descargar CANCELLATIONS_RTA (reciente)
-        run: |
-          rclone copy "gdrive:" CANCELLATIONS_RTA/ \
-            --drive-root-folder-id 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u \
-            --transfers 32 --checkers 32 --fast-list --max-age 3d -v
+          fallo=0
+          wait $pid_courier || { echo "::error::Falló la descarga de COURIER_DAILY";     fallo=1; }
+          wait $pid_conn    || { echo "::error::Falló la descarga de CONNECTIONS";       fallo=1; }
+          wait $pid_rta     || { echo "::error::Falló la descarga de CANCELLATIONS_RTA"; fallo=1; }
+          [ "$fallo" -eq 0 ] || exit 1
+
+          for d in COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA; do
+            echo "$d: $(find "$d" -name '*.csv' | wc -l) ficheros"
+          done
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -63,26 +103,36 @@ jobs:
 
       - name: Instalar librerías
         run: |
-          python -m pip install --upgrade pip
-          pip install polars pyarrow supabase
-          
+          python -m pip install --upgrade pip --quiet
+          pip install --quiet polars pyarrow supabase
 
-      # 3. EJECUTAR PIPELINE (bronce viejo + CSVs nuevos → actualiza)
       - name: Ejecutar pipeline
         run: python -u proceso_completo_uber.py
         env:
           SUPABASE_METRICS_URL: ${{ secrets.SUPABASE_METRICS_URL }}
           SUPABASE_METRICS_SERVICE_KEY: ${{ secrets.SUPABASE_METRICS_SERVICE_KEY }}
+          SUPABASE_SYNC_DAYS: '7'
 
-      # 4. SUBIR BRONZE ACTUALIZADO + el parquet de producción
-      - name: Subir bronce actualizado a Drive
+      - name: Tamaño de la salida
         run: |
+          { echo "### Salida"; echo '```'; ls -lh datos_salida/; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir bronce y resultado a Drive
+        run: |
+          # --drive-chunk-size 128M: por defecto rclone sube a Drive en trozos de
+          # 8 MB, lo que hace lentísimos los ficheros grandes (este paso tardaba
+          # ~4 min, el 41% del run). Cada transferencia reserva ese tamaño en
+          # RAM, de ahí bajar --transfers a 4 → 4 x 128 MB = 512 MB.
           rclone copy datos_salida/ "gdrive:" \
-            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ \
+            --drive-root-folder-id "$DRIVE_BRONZE" \
             --include "bronze_*.parquet" \
-            --transfers 8 --checkers 8 -v
+            --drive-chunk-size 128M --transfers 4 --checkers 8 \
+            --stats-one-line --stats 30s -v
 
-      - name: Subir resultado a Drive
-        run: |
           rclone copy datos_salida/rides_silver.parquet "gdrive:" \
-            --drive-root-folder-id 1WMsH1E6CRLcT1BgZ0voDpt62yf6m0vy_ -v
+            --drive-root-folder-id "$DRIVE_BRONZE" \
+            --drive-chunk-size 128M -v
+
+      - name: Fin
+        if: always()
+        run: echo "### Fin · $(TZ=Europe/Madrid date '+%H:%M:%S %Z')" >> "$GITHUB_STEP_SUMMARY"
