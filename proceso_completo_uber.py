@@ -2,13 +2,13 @@
 """
 Pipeline Closer Logistics — Viajes + Connections con regla de las 02:00
 =======================================================================
-VERSIÓN: v5.3-exportaciones-completas  (2026-09-21)
+VERSIÓN: v5.4-mercados  (2026-09-21)
 
   TODO se calcula desde Connections (viajes, horas, aceptados, cancelados,
   % aceptación, % cancelación). El silver solo aporta metadatos del rider.
   Días sin cobertura de Connections se descartan.
 
-CAMBIOS DE ESTA VERSIÓN (v5.3) — ver comentarios marcados [FIX 1/2/3/4]:
+CAMBIOS DE ESTA VERSIÓN (v5.4) — ver comentarios marcados [FIX 1..5]:
 
   Síntoma: el TPH salía a la mitad de lo que muestran Uber y el dashboard
   de BigQuery. Un rider con 33,73 h y 65 viajes (TPH 1,93) aparecía aquí
@@ -26,7 +26,7 @@ CAMBIOS DE ESTA VERSIÓN (v5.3) — ver comentarios marcados [FIX 1/2/3/4]:
   que se desmadraba era online_hours, porque se sustituía sola.
 """
 
-PIPELINE_VERSION = "v5.3-exportaciones-completas"
+PIPELINE_VERSION = "v5.4-mercados"
 
 import os
 import io
@@ -81,6 +81,12 @@ BRONZE_RETENTION_DAYS = int(os.environ.get('BRONZE_RETENTION_DAYS', '60'))
 
 # Hora de corte del día lógico (registros antes de esto → día anterior)
 LOGICAL_DAY_CUTOFF_HOUR = 2
+
+# UUID de un rider a inspeccionar (opcional). Si se define, el pipeline imprime
+# sus filas crudas del bronze antes de consolidar. Sirve para contrastar un
+# caso concreto contra el panel de Uber sin tener que adivinar:
+#   DEBUG_UUID=2c7de639-9911-4736-8b50-cbd21e6e1dee python proceso_completo_uber.py
+DEBUG_UUID = os.environ.get('DEBUG_UUID', '').strip()
 
 # Patrones de archivo
 DAILY_PATTERN = re.compile(r'COURIER_DAILY.*\.csv$', re.IGNORECASE)
@@ -537,13 +543,68 @@ def build_silver(bronze_daily):
         pl.col('datestr').is_not_null() & pl.col('driver_uuid').is_not_null()
     )
 
-    # --- Paso 1: una versión por (uuid, día, zona) ---
-    zona_cols = [c for c in ['city_id', 'city_name'] if c in base.columns]
+    # --- Diagnóstico: cuántos (rider, día) tienen VARIOS mercados ---
+    # Es lo que [FIX 5] recupera. Si sale 0, este pipeline no tiene el problema
+    # de los mercados perdidos y hay que buscar la diferencia en otro sitio.
+    if 'market_name' in base.columns:
+        _multi = (
+            base.group_by(['driver_uuid', 'datestr'])
+                .agg(pl.col('market_name').n_unique().alias('_n'))
+                .filter(pl.col('_n') > 1)
+        )
+        print(f"[silver] (rider, día) con más de un mercado: {len(_multi):,}")
+
+    # --- Diagnóstico de un rider concreto (DEBUG_UUID) ---
+    if DEBUG_UUID:
+        _d = base.filter(pl.col('driver_uuid') == DEBUG_UUID)
+        print(f"\n[debug] Filas crudas del bronze para {DEBUG_UUID}: {len(_d)}")
+        _cols = [c for c in ['datestr', 'market_name', 'city_name', 'file_name',
+                             'online_hours', 'active_hours', 'num_of_trips'] if c in _d.columns]
+        for fila in _d.sort('datestr').select(_cols).iter_rows(named=True):
+            print('[debug]  ' + '  '.join(
+                f"{k}={round(v, 2) if isinstance(v, float) else v}" for k, v in fila.items()))
+        print()
+
+    # ------------------------------------------------------------------ [FIX 5]
+    # --- Paso 1: quedarse con la exportación MÁS RECIENTE de cada (uuid, día),
+    #     conservando TODAS sus filas de mercado ---
+    #
+    # Uber exporta UNA FILA POR MERCADO. Un rider que trabaja en dos mercados
+    # de la misma ciudad (p. ej. MADRID CARABANCHEL y MADRID CENTRO) sale en
+    # dos filas con el MISMO city_id y city_name, y solo se distinguen por
+    # market_name.
+    #
+    # La clave de dedup anterior era (driver_uuid, datestr, city_id,
+    # city_name) — sin market_name. Las dos filas colisionaban y unique()
+    # descartaba una: el día de ese rider perdía un mercado entero.
+    # Medido sobre un CSV real: en las combinaciones (rider, día) con dos
+    # mercados, quedarse con una sola fila conserva el 67% de las horas.
+    #
+    # No basta con añadir market_name a la clave. Si una exportación vieja
+    # tenía al rider en el mercado A y una nueva lo reclasifica al B, sumar
+    # ambas contaría de más. Por eso se hace en dos tiempos:
+    #   1. Por cada (rider, día), la exportación más reciente que lo contenga.
+    #   2. De ESA exportación, todas sus filas de mercado.
+    # Así nunca se mezclan versiones distintas del mismo día.
+    ultimo_por_dia = (
+        base.group_by(['driver_uuid', 'datestr'])
+            .agg(pl.col('file_date').max().alias('_file_mas_reciente'))
+    )
+    base = (
+        base.join(ultimo_por_dia, on=['driver_uuid', 'datestr'], how='inner')
+            .filter(pl.col('file_date') == pl.col('_file_mas_reciente'))
+            .drop('_file_mas_reciente')
+    )
+
+    # Dentro de esa exportación, una fila por mercado (por si el propio
+    # fichero trae la misma repetida).
+    zona_cols = [c for c in ['city_id', 'city_name', 'market_name'] if c in base.columns]
     ident_keys = ['driver_uuid', 'datestr'] + zona_cols
     base = (
-        base.sort(['file_date', 'num_of_trips'], descending=[True, True], nulls_last=True)
+        base.sort(['num_of_trips'], descending=[True], nulls_last=True)
             .unique(subset=ident_keys, keep='first', maintain_order=True)
     )
+    # -------------------------------------------------------------------------
 
     # --- Paso 2: sumar todas las zonas del mismo (uuid, día) ---
     # Columnas que se SUMAN (cantidades absolutas)
