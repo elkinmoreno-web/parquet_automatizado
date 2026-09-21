@@ -67,7 +67,7 @@ jobs:
           bajar_csv () {
             rclone copy "gdrive:" "$1/" \
               --drive-root-folder-id "$2" \
-              --transfers 12 --checkers 12 --fast-list --max-age 12d \
+              --transfers 12 --checkers 12 --fast-list --max-age 3d \
               --stats-one-line --stats 30s
           }
 
