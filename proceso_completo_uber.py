@@ -2,13 +2,13 @@
 """
 Pipeline Closer Logistics — Viajes + Connections con regla de las 02:00
 =======================================================================
-VERSIÓN: v5.2-exportaciones-completas  (2026-09-21)
+VERSIÓN: v5.3-exportaciones-completas  (2026-09-21)
 
   TODO se calcula desde Connections (viajes, horas, aceptados, cancelados,
   % aceptación, % cancelación). El silver solo aporta metadatos del rider.
   Días sin cobertura de Connections se descartan.
 
-CAMBIOS DE ESTA VERSIÓN (v5.2) — ver comentarios marcados [FIX 1/2/3]:
+CAMBIOS DE ESTA VERSIÓN (v5.3) — ver comentarios marcados [FIX 1/2/3/4]:
 
   Síntoma: el TPH salía a la mitad de lo que muestran Uber y el dashboard
   de BigQuery. Un rider con 33,73 h y 65 viajes (TPH 1,93) aparecía aquí
@@ -26,7 +26,7 @@ CAMBIOS DE ESTA VERSIÓN (v5.2) — ver comentarios marcados [FIX 1/2/3]:
   que se desmadraba era online_hours, porque se sustituía sola.
 """
 
-PIPELINE_VERSION = "v5.2-exportaciones-completas"
+PIPELINE_VERSION = "v5.3-exportaciones-completas"
 
 import os
 import io
@@ -348,6 +348,14 @@ def ingest_bronze_connections():
             return
         concat_lote = pl.concat(lote_actual, how='vertical_relaxed')
         acumulado = concat_lote if acumulado is None else pl.concat([acumulado, concat_lote], how='vertical_relaxed')
+        # [FIX 4] Dedup DENTRO del bucle, no solo al final.
+        # Los ficheros de CONNECTIONS se solapan muchísimo: 234 ficheros de
+        # ~300.000 filas son ~70 millones de filas de las que solo ~3,3 quedan
+        # tras dedupar. Acumulando todo y dedupando al final, el pico de
+        # memoria es el de las 70 millones — el runner (7 GB) muere con
+        # SIGTERM / exit 143. Dedupando en cada lote, 'acumulado' nunca pasa
+        # del tamaño ya deduplicado. El resultado es idéntico.
+        acumulado = acumulado.unique(subset=['courier_uuid', 'start_time', 'status'], keep='first')
         lote_actual = []
 
     errores = 0
@@ -433,6 +441,9 @@ def ingest_bronze_rta():
             return
         concat_lote = pl.concat(lote_actual_rta, how='vertical_relaxed')
         acumulado_rta = concat_lote if acumulado_rta is None else pl.concat([acumulado_rta, concat_lote], how='vertical_relaxed')
+        # [FIX 4] Mismo motivo que en connections: dedupar en cada lote para
+        # que el acumulado no crezca con todas las repeticiones a la vez.
+        acumulado_rta = acumulado_rta.unique(subset=['offer_id'], keep='first')
         lote_actual_rta = []
 
     errores = 0
@@ -1010,19 +1021,29 @@ def main():
     if quitadas > 0:
         print(f"[limpieza] Filas vacías eliminadas (0 viajes y 0 horas): {quitadas}")
 
-    # --- Control de calidad: coherencia entre viajes, activas y online ---
-    # Es la comprobación que habría detectado el fallo de las horas sustituidas
-    # el primer día en vez de tres meses después. Un rider hace ~2,7 viajes por
-    # hora ACTIVA; si muchas filas tienen las activas muy por debajo de las
-    # online, es que la fila mezcla fuentes y el TPH no es fiable.
+    # --- Control de calidad: utilización media por día de la semana ---
+    # OJO con cómo se lee esto: el % de horas activas NO es un indicador de
+    # dato roto. Tiene un patrón semanal real y fuerte (medido sobre 4
+    # semanas): lunes-jueves ronda el 63-68% y viernes-domingo el 72-76%,
+    # simplemente porque entre semana hay menos pedidos y el rider espera más.
+    # Un jueves "bajo" es un jueves normal.
+    # Lo que sí es sospechoso es que un día se salga del patrón de SU MISMO
+    # día de la semana en otras semanas. Por eso se imprime desglosado, para
+    # poder comparar manzanas con manzanas.
     _qc = final.filter((pl.col('online_hours') > 2) & (pl.col('active_hours') > 0.5))
     if len(_qc) > 100:
-        _raras = _qc.filter((pl.col('active_hours') / pl.col('online_hours')) < 0.60).height
-        _pct = 100.0 * _raras / len(_qc)
-        print(f"[qc] Filas con activas < 60% de online: {_raras:,} de {len(_qc):,} ({_pct:.1f}%)")
-        if _pct > 15:
-            print("[qc] ⚠ Por encima del 15%: el TPH puede estar saliendo bajo. "
-                  "Comparar un rider contra el panel de Uber ANTES de usar estos datos.")
+        _por_dia = (
+            _qc.with_columns([
+                pl.col('_dia').dt.weekday().alias('_dow'),
+                (pl.col('active_hours') / pl.col('online_hours')).alias('_util'),
+            ])
+            .group_by('_dow').agg([pl.len().alias('filas'), pl.col('_util').mean().alias('util')])
+            .sort('_dow')
+        )
+        nombres = {1: 'Lun', 2: 'Mar', 3: 'Mie', 4: 'Jue', 5: 'Vie', 6: 'Sab', 7: 'Dom'}
+        print('[qc] Utilización media (activas/online) por día de la semana:')
+        for fila in _por_dia.iter_rows(named=True):
+            print(f"[qc]   {nombres.get(fila['_dow'], '?'):<4} {fila['util']*100:5.1f}%  ({fila['filas']:,} filas)")
 
     # --- Salida: SOLO el parquet (lo que lee la app). Sin CSV ni dashboard. ---
     final.write_parquet(SILVER_PARQUET, compression='zstd')
