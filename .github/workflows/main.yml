@@ -108,7 +108,7 @@ jobs:
           pip install --quiet polars pyarrow supabase
 
       - name: Ejecutar pipeline
-        run: DEBUG_UUID=2c7de639-9911-4736-8b50-cbd21e6e1dee python -u proceso_completo_uber.py
+        run: python -u proceso_completo_uber.py
         env:
           SUPABASE_METRICS_URL: ${{ secrets.SUPABASE_METRICS_URL }}
           SUPABASE_METRICS_SERVICE_KEY: ${{ secrets.SUPABASE_METRICS_SERVICE_KEY }}
