@@ -115,7 +115,7 @@ jobs:
           # Solo se suben a Supabase los días que de verdad pueden haber
           # cambiado (las descargas traen --max-age 3d). Para un rebackfill
           # completo, lanza el workflow a mano y sube este número a 21.
-          SUPABASE_SYNC_DAYS: '7'
+          SUPABASE_SYNC_DAYS: '21'
 
       - name: Tamaño de la salida
         run: |
