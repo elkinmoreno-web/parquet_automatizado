@@ -2,14 +2,31 @@
 """
 Pipeline Closer Logistics — Viajes + Connections con regla de las 02:00
 =======================================================================
-VERSIÓN: v2.0-connections-only  (2026-06-02)
+VERSIÓN: v5.2-exportaciones-completas  (2026-09-21)
 
   TODO se calcula desde Connections (viajes, horas, aceptados, cancelados,
   % aceptación, % cancelación). El silver solo aporta metadatos del rider.
   Días sin cobertura de Connections se descartan.
+
+CAMBIOS DE ESTA VERSIÓN (v5.2) — ver comentarios marcados [FIX 1/2/3]:
+
+  Síntoma: el TPH salía a la mitad de lo que muestran Uber y el dashboard
+  de BigQuery. Un rider con 33,73 h y 65 viajes (TPH 1,93) aparecía aquí
+  con 33,73 h y 42 viajes (TPH 1,25). Medido sobre 16.921 filas: el 31%
+  tenía las horas infladas respecto a sus propios viajes.
+
+  Prueba que lo identificó — viajes por hora, agrupando por si la fila era
+  "rara" (active_hours < 60% de online_hours):
+
+                          filas normales   filas raras (31%)
+      viajes / hora ACTIVA     2,72             2,82   <- iguales
+      viajes / hora ONLINE     2,21             1,21   <- la mitad
+
+  num_of_trips y active_hours son coherentes entre sí SIEMPRE. La columna
+  que se desmadraba era online_hours, porque se sustituía sola.
 """
 
-PIPELINE_VERSION = "v5.1-bronce-podado"
+PIPELINE_VERSION = "v5.2-exportaciones-completas"
 
 import os
 import io
@@ -201,16 +218,31 @@ def ingest_bronze_daily():
             continue
         files.append({'path': path, 'name': name, 'ts': extract_ts(name) or datetime.min})
 
-    # Quedarse con el más reciente por día (igual que el pipeline viejo)
-    por_dia = {}
-    for f in files:
-        d = f['ts'].date()
-        if d not in por_dia or f['ts'] > por_dia[d]['ts']:
-            por_dia[d] = f
-    candidatos = sorted(por_dia.values(), key=lambda f: f['ts'])
+    # ------------------------------------------------------------------ [FIX 1]
+    # Se procesan TODAS las exportaciones, no solo la última de cada día.
+    #
+    # Uber exporta varias veces al día (06:56, 08:54, 11:50, 12:51, 17:19...).
+    # CADA exportación lleva el día en curso CORTADO a esa hora: la de las
+    # 17:19 no tiene las tardes ni las noches. El día solo queda completo en
+    # una exportación POSTERIOR, normalmente la del día siguiente.
+    #
+    # El código anterior se quedaba con una sola exportación por día de
+    # exportación, así que muchos días se quedaban congelados en su versión
+    # parcial y nunca llegaba la buena. De ahí que los viajes salieran ~35%
+    # por debajo de lo que muestra Uber.
+    #
+    # Procesarlas todas no duplica nada: build_silver ya ordena por file_date
+    # descendente y se queda con la fila más reciente de cada
+    # (driver_uuid, datestr, zona). Simplemente hoy no tiene entre qué elegir.
+    #
+    # Es además lo que hace el cargador de BigQuery (WRITE_APPEND de todos los
+    # ficheros + una vista que elige una fila por conductor y día), y por eso
+    # sus números sí cuadran con Uber.
+    candidatos = sorted(files, key=lambda f: f['ts'])
+    # -------------------------------------------------------------------------
 
     nuevos = [f for f in candidatos if f['name'] not in processed]
-    print(f"[daily] Archivos nuevos a procesar: {len(nuevos)}")
+    print(f"[daily] Archivos nuevos a procesar: {len(nuevos)} (de {len(files)} en disco)")
 
     new_dfs = []
     errores = 0
@@ -576,8 +608,9 @@ def reconstruct_connections(bronze_conn):
     algo corto y se completa en la exportación siguiente — tenlo en cuenta si
     algún día bajas el colchón de 2 días del dashboard.
 
-    horas_conn se usa como respaldo: si el online_hours del silver difiere
-    mucho de las horas reales (CSV incompleto), el ajuste usa horas_conn.
+    horas_conn ya NO se usa para sustituir online_hours (ver [FIX 2]): solo
+    queda como diagnóstico, para poder medir cuántos días del silver siguen
+    llegando incompletos.
 
     Una sesión que CRUZA las 02:00 cuenta solo la parte real antes del corte.
     """
@@ -645,14 +678,11 @@ def apply_adjustment(silver, rta, conn):
     porque ya viene correcto de Uber. Lo único que hacemos es MOVER la parte
     de madrugada (< 02:00) de cada día al día anterior.
 
-    La fracción de madrugada se calcula con timestamps reales:
-      - PEDIDOS (viajes, accept, cancel) → fracción de RTA (frac_rta)
-      - HORAS (online_hours, p2, p3, etc.) → fracción de Connections (frac_horas)
+    La fracción de madrugada se calcula con timestamps reales de Connections.
 
     Para cada (rider, día D):
-      mover_pedidos = total_silver(D) * frac_rta(D)   → de D a D-1
-      mover_horas   = horas_silver(D) * frac_horas(D) → de D a D-1
-    Si un día no tiene RTA/Connections, su fracción es 0 → no se mueve nada.
+      mover = total_silver(D) * frac_horas(D)   → de D a D-1
+    Si un día no tiene Connections, su fracción es 0 → no se mueve nada.
 
     Pedidos/viajes: enteros (round). Horas: decimal.
     % aceptación/cancelación: se recalculan con los totales ya movidos,
@@ -681,21 +711,40 @@ def apply_adjustment(silver, rta, conn):
         pl.col('rta_madrugada').fill_null(0),
     ])
 
-    # --- Corrección de horas incompletas del silver (Opción B) ---
-    # El online_hours del CSV de Uber a veces llega incompleto (el día no se
-    # había consolidado al exportar). Si Connections difiere en más de 1 hora,
-    # usamos las horas de Connections (que coinciden con el panel de Uber).
-    # El 95% de los días coinciden, así que esto solo corrige el ~4% problemático.
+    # ------------------------------------------------------------------ [FIX 2]
+    # ELIMINADA la sustitución de online_hours por horas_conn.
+    #
+    # Lo que hacía: si Connections y el CSV diferían en más de 1 hora, se
+    # pisaba online_hours con el valor de Connections. El problema es que
+    # cuando la fila del CSV viene incompleta, NO SOLO las horas están
+    # incompletas: también num_of_trips y active_hours. Al corregir una sola
+    # columna, la fila queda incoherente y tph = viajes/horas sale a la mitad.
+    #
+    # Una fila parcial, entera, es coherente (pocos viajes y pocas horas → TPH
+    # correcto). Parcheando solo las horas se rompe eso.
+    #
+    # Medido sobre 16.921 filas de producción antes de este cambio:
+    #                           filas normales   filas parcheadas (31%)
+    #     viajes / hora ACTIVA      2,72               2,82   <- iguales
+    #     viajes / hora ONLINE      2,21               1,21   <- la mitad
+    #
+    # Con [FIX 1] las filas del CSV ya llegan completas, así que esta muleta
+    # no hace falta. Se conserva solo como DIAGNÓSTICO: si el aviso de abajo
+    # sigue apareciendo mucho, es que el CSV sigue llegando incompleto y hay
+    # que mirar la descarga, no parchear columnas sueltas.
     if 'horas_conn' in s.columns and 'online_hours' in s.columns:
-        s = s.with_columns(
-            pl.when(
-                pl.col('horas_conn').is_not_null() &
-                ((pl.col('horas_conn') - pl.col('online_hours')).abs() > 1.0)
-            )
-            .then(pl.col('horas_conn'))
-            .otherwise(pl.col('online_hours'))
-            .alias('online_hours')
-        )
+        _desajustadas = s.filter(
+            pl.col('horas_conn').is_not_null() &
+            ((pl.col('horas_conn') - pl.col('online_hours')).abs() > 1.0)
+        ).height
+        if _desajustadas:
+            _pct = 100.0 * _desajustadas / max(len(s), 1)
+            print(f"[ajuste] Días donde Connections y el CSV difieren >1h: "
+                  f"{_desajustadas:,} ({_pct:.1f}%) — NO se sustituye nada")
+            if _pct > 10:
+                print("[ajuste] ⚠ Por encima del 10%: el CSV de COURIER_DAILY "
+                      "está llegando incompleto, revisar la descarga")
+    # -------------------------------------------------------------------------
 
     # Columnas de PEDIDOS y de HORAS — TODO se mueve con la MISMA fracción
     # (frac_horas de Connections), para que viajes y horas viajen JUNTOS y el
@@ -707,6 +756,37 @@ def apply_adjustment(silver, rta, conn):
     HORA_COLS = [c for c in ['online_hours', 'active_hours', 'open_hours',
                              'enroute_p2_hours', 'ontrip_p3_hours', 'unavailable_hours',
                              'p2_km', 'p2_min', 'p3_km', 'p3_min', 'total_km', 'total_min'] if c in s.columns]
+
+    # ------------------------------------------------------------------ [FIX 3]
+    # Solo se mueve a un día que EXISTA como fila.
+    #
+    # El traspaso se hacía restando de D y sumando a D-1 con un left join. Si
+    # D-1 no existía (el rider no trabajó ese día, o D es el día más antiguo de
+    # la ventana), el join no encontraba destino y lo restado NO SE SUMABA EN
+    # NINGÚN SITIO: esos viajes y esas horas desaparecían. En el día más
+    # antiguo de la ventana pasaba SIEMPRE.
+    #
+    # Se marca cada fila con si su D-1 existe, y si no existe se pone su
+    # fracción a 0: el día conserva sus totales íntegros, que es preferible a
+    # perderlos.
+    _destinos = (
+        s.select(['driver_uuid', '_dia']).unique()
+         .with_columns((pl.col('_dia') + pl.duration(days=1)).alias('_dia'))
+         .with_columns(pl.lit(True).alias('_destino_existe'))
+    )
+    s = s.join(_destinos, on=['driver_uuid', '_dia'], how='left')
+    s = s.with_columns(pl.col('_destino_existe').fill_null(False))
+
+    _sin_destino = s.filter((pl.col('frac_horas') > 0) & ~pl.col('_destino_existe')).height
+    if _sin_destino:
+        print(f"[ajuste] {_sin_destino:,} días con madrugada pero sin día anterior "
+              f"en la ventana: se dejan íntegros (antes se perdían)")
+
+    s = s.with_columns(
+        pl.when(pl.col('_destino_existe')).then(pl.col('frac_horas'))
+          .otherwise(0.0).alias('frac_horas')
+    )
+    # -------------------------------------------------------------------------
 
     # --- Cantidad que se mueve al día anterior ---
     # Connections es la fuente ÚNICA de la madrugada (mide horas Y actividad con
@@ -723,7 +803,6 @@ def apply_adjustment(silver, rta, conn):
     s = s.with_columns(mv_exprs)
 
     # --- Construir los movimientos (lo que entra en D-1) ---
-    move_cols = ['mv_' + c for c in PEDIDO_COLS + HORA_COLS]
     movidos = s.select(
         ['driver_uuid'] +
         [(pl.col('_dia') - pl.duration(days=1)).alias('_dia')] +
@@ -773,7 +852,8 @@ def apply_adjustment(silver, rta, conn):
     ])
 
     # Limpiar auxiliares
-    aux = ['frac_rta', 'frac_horas', 'rta_madrugada', 'horas_conn'] + ['mv_' + c for c in PEDIDO_COLS + HORA_COLS] + \
+    aux = ['frac_rta', 'frac_horas', 'rta_madrugada', 'horas_conn', '_destino_existe'] + \
+          ['mv_' + c for c in PEDIDO_COLS + HORA_COLS] + \
           ['in_' + c for c in PEDIDO_COLS + HORA_COLS]
     s = s.drop([c for c in aux if c in s.columns])
     return s
@@ -930,14 +1010,26 @@ def main():
     if quitadas > 0:
         print(f"[limpieza] Filas vacías eliminadas (0 viajes y 0 horas): {quitadas}")
 
+    # --- Control de calidad: coherencia entre viajes, activas y online ---
+    # Es la comprobación que habría detectado el fallo de las horas sustituidas
+    # el primer día en vez de tres meses después. Un rider hace ~2,7 viajes por
+    # hora ACTIVA; si muchas filas tienen las activas muy por debajo de las
+    # online, es que la fila mezcla fuentes y el TPH no es fiable.
+    _qc = final.filter((pl.col('online_hours') > 2) & (pl.col('active_hours') > 0.5))
+    if len(_qc) > 100:
+        _raras = _qc.filter((pl.col('active_hours') / pl.col('online_hours')) < 0.60).height
+        _pct = 100.0 * _raras / len(_qc)
+        print(f"[qc] Filas con activas < 60% de online: {_raras:,} de {len(_qc):,} ({_pct:.1f}%)")
+        if _pct > 15:
+            print("[qc] ⚠ Por encima del 15%: el TPH puede estar saliendo bajo. "
+                  "Comparar un rider contra el panel de Uber ANTES de usar estos datos.")
+
     # --- Salida: SOLO el parquet (lo que lee la app). Sin CSV ni dashboard. ---
     final.write_parquet(SILVER_PARQUET, compression='zstd')
     print(f"\n✓ Parquet final: {SILVER_PARQUET} ({len(final):,} filas)")
 
     # --- Sincronizar el resultado a Supabase (reemplaza a la API Fleet Manager) ---
     sync_to_supabase(final)
-
-
 
     # --- Chequeo de integridad: una sola fila por (rider, día) ---
     dups = (final.with_columns(pl.col('datestr').dt.date().alias('_d'))
