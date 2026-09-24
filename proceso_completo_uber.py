@@ -2,13 +2,18 @@
 """
 Pipeline Closer Logistics — Viajes + Connections con regla de las 02:00
 =======================================================================
-VERSIÓN: v5.4-mercados  (2026-09-21)
+VERSIÓN: v5.5-cierre-dia  (2026-09-24)
 
   TODO se calcula desde Connections (viajes, horas, aceptados, cancelados,
   % aceptación, % cancelación). El silver solo aporta metadatos del rider.
   Días sin cobertura de Connections se descartan.
 
-CAMBIOS DE ESTA VERSIÓN (v5.4) — ver comentarios marcados [FIX 1..5]:
+CAMBIOS DE ESTA VERSIÓN (v5.5) — ver comentarios marcados [FIX 6] y [FIX 7]:
+
+  [FIX 6] El pipeline marca cada día como CERRADO al terminar de subirlo.
+  [FIX 7] Un aborto por falta de datos sale en ROJO en GitHub Actions.
+
+CAMBIOS DE LA VERSIÓN ANTERIOR (v5.4) — comentarios marcados [FIX 1..5]:
 
   Síntoma: el TPH salía a la mitad de lo que muestran Uber y el dashboard
   de BigQuery. Un rider con 33,73 h y 65 viajes (TPH 1,93) aparecía aquí
@@ -26,16 +31,17 @@ CAMBIOS DE ESTA VERSIÓN (v5.4) — ver comentarios marcados [FIX 1..5]:
   que se desmadraba era online_hours, porque se sustituía sola.
 """
 
-PIPELINE_VERSION = "v5.4-mercados"
+PIPELINE_VERSION = "v5.5-cierre-dia"
 
 import os
+import sys
 import io
 import re
 import glob
 import json
 import gzip
 import base64
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import polars as pl
 from supabase import create_client
 
@@ -1016,6 +1022,32 @@ def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
 
     print(f'[sync_to_supabase] {subidos} filas sincronizadas a Supabase (ventana: ultimos {ventana_dias} dias)')
 
+    # ------------------------------------------------------------------ [FIX 6]
+    # Marca de "dia cerrado" en la tabla pipeline_cargas.
+    #
+    # Va DESPUES del bucle a proposito: solo se escribe si TODOS los lotes han
+    # subido bien. Si el proceso muere a medias, la marca se queda con la fecha
+    # anterior y el CRM sabe que el dia no esta listo.
+    #
+    # Lo necesita el aviso de TPH a los riders. Antes el CRM miraba el
+    # created_at mas reciente de driver_daily_stats para decidir si podia
+    # enviar, y como esta subida va por lotes de 1.000 con UPSERT, en cuanto
+    # aterrizaba el PRIMER lote ya daba verde con miles de filas por subir.
+    # Resultado medido: el 22-sep salieron 42 correos de 306 riders en rojo, y
+    # el 23-sep, 28 de 295. Con esta marca la decision pasa a ser exacta en
+    # lugar de estimada.
+    conteos = {}
+    for r in registros:
+        conteos[r['day']] = conteos.get(r['day'], 0) + 1
+
+    ahora = datetime.now(timezone.utc).isoformat()
+    supabase.table('pipeline_cargas').upsert(
+        [{'dia': dia, 'filas': n, 'cerrado_en': ahora} for dia, n in conteos.items()],
+        on_conflict='dia',
+    ).execute()
+    print(f'[sync_to_supabase] Dias marcados como cerrados: {len(conteos)} -> {sorted(conteos)}')
+    # -------------------------------------------------------------------------
+
 
 # =============================================================================
 # 5. MAIN
@@ -1026,7 +1058,12 @@ def main():
     bronze_daily = ingest_bronze_daily()
     if bronze_daily is None:
         print("\n✗ No hay datos de COURIER_DAILY. Abortando.")
-        return
+        # ------------------------------------------------------------- [FIX 7]
+        # sys.exit(1) y NO 'return': con return el script terminaba con codigo
+        # 0 y GitHub Actions marcaba la ejecucion en VERDE aunque no hubiera
+        # ingerido ni una fila. Un fallo de descarga (por ejemplo el token de
+        # Drive caducado) se veia igual que una ejecucion correcta.
+        sys.exit(1)
     bronze_conn = ingest_bronze_connections()
     bronze_rta  = ingest_bronze_rta()
 
