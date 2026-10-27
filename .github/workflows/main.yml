@@ -18,7 +18,7 @@ on:
       dias_supabase:
         description: 'Días hacia atrás que se suben a Supabase (21 normalmente; 60 una vez para rellenar columnas nuevas)'
         required: false
-        default: '60'
+        default: '21'
 
 # Dos ejecuciones a la vez corromperían el bronce: las dos lo bajan, cada una
 # le añade cosas distintas, y la última en subir pisa el trabajo de la otra.
