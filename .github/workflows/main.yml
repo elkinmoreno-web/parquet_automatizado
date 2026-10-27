@@ -14,6 +14,11 @@ on:
     - cron: '39 18 * * *'    # objetivo 19:30
       timezone: 'Europe/Madrid'
   workflow_dispatch:
+    inputs:
+      dias_supabase:
+        description: 'Días hacia atrás que se suben a Supabase (21 normalmente; 60 una vez para rellenar columnas nuevas)'
+        required: false
+        default: '21'
 
 # Dos ejecuciones a la vez corromperían el bronce: las dos lo bajan, cada una
 # le añade cosas distintas, y la última en subir pisa el trabajo de la otra.
@@ -29,6 +34,11 @@ env:
   DRIVE_COURIER:       1PNsRT6zCBmOFLqLqhvWqis68Ih0VpxyY
   DRIVE_CONNECTIONS:   14jpv8c2nLlJwXH_CcYE2YdBxPA3lQif1
   DRIVE_CANCELLATIONS: 1eT7lC1J86Zr3P7wX7S2Nm_IvE_wA-R2u
+  # Variables en Vivo del CRM: carpetas de Uber con los informes CANCEL, LATE_TRIPS y
+  # TRIPS_DATA (km por pedido). Vacías = no se bajan (el resto del pipeline no cambia).
+  DRIVE_CANCEL:        1-VkoE9_lCObLBGHtSJmBtoVBlz71_XTT
+  DRIVE_LATE_TRIPS:    1aWbyRAkXIiniXFqYf2NNjmjNvkxuDpcM
+  DRIVE_TRIPS:         1a4Ff78fWbnmLmpMSvb2ORXhIpHbOLJus
 
 jobs:
   run-pipeline:
@@ -57,7 +67,7 @@ jobs:
           EOF
 
       - name: Crear carpetas de trabajo
-        run: mkdir -p COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA datos_salida
+        run: mkdir -p COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA CANCEL LATE_TRIPS TRIPS_DATA datos_salida
 
       - name: Bajar bronce y CSVs recientes en paralelo
         shell: bash
@@ -71,6 +81,15 @@ jobs:
               --stats-one-line --stats 30s
           }
 
+          # TRIPS_DATA: cada fichero (~100 MB) trae los últimos ~5 días, así que basta el más reciente.
+          bajar_ultimo () {
+            local ultimo
+            ultimo=$(rclone lsf "gdrive:" --drive-root-folder-id "$2" --files-only --format "tp" --separator "|" --max-age 3d \
+                     | grep -i '\.csv$' | sort | tail -1 | cut -d'|' -f2)
+            [ -n "$ultimo" ] || { echo "Sin CSV de $1 en los últimos 3 días"; return 0; }
+            rclone copy "gdrive:" "$1/" --drive-root-folder-id "$2" --include "/$ultimo" --stats-one-line --stats 30s
+          }
+
           # El bronce se baja a la vez que los CSV: no dependen entre sí.
           rclone copy "gdrive:" datos_salida/ \
             --drive-root-folder-id "$DRIVE_BRONZE" \
@@ -80,6 +99,10 @@ jobs:
           bajar_csv COURIER_DAILY     "$DRIVE_COURIER"       & pid_courier=$!
           bajar_csv CONNECTIONS       "$DRIVE_CONNECTIONS"   & pid_conn=$!
           bajar_csv CANCELLATIONS_RTA "$DRIVE_CANCELLATIONS" & pid_rta=$!
+          pid_cancel=''; pid_late=''; pid_trips=''
+          [ -n "$DRIVE_CANCEL" ]     && { bajar_csv CANCEL     "$DRIVE_CANCEL"     & pid_cancel=$!; }
+          [ -n "$DRIVE_LATE_TRIPS" ] && { bajar_csv LATE_TRIPS "$DRIVE_LATE_TRIPS" & pid_late=$!; }
+          [ -n "$DRIVE_TRIPS" ]      && { bajar_ultimo TRIPS_DATA "$DRIVE_TRIPS"   & pid_trips=$!; }
 
           # IMPORTANTE: 'wait PID' devuelve el estado real SOLO si lo último que
           # ejecuta el proceso de fondo es el propio rclone. Por eso se usan
@@ -92,8 +115,12 @@ jobs:
           wait $pid_conn    || { echo "::error::Falló la descarga de CONNECTIONS";       fallo=1; }
           wait $pid_rta     || { echo "::error::Falló la descarga de CANCELLATIONS_RTA"; fallo=1; }
           [ "$fallo" -eq 0 ] || exit 1
+          # Los de Variables en Vivo no paran el pipeline: sin ellos las métricas salen igual.
+          [ -z "$pid_cancel" ] || wait $pid_cancel || echo "::warning::Falló la descarga de CANCEL"
+          [ -z "$pid_late" ]   || wait $pid_late   || echo "::warning::Falló la descarga de LATE_TRIPS"
+          [ -z "$pid_trips" ]  || wait $pid_trips  || echo "::warning::Falló la descarga de TRIPS_DATA"
 
-          for d in COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA; do
+          for d in COURIER_DAILY CONNECTIONS CANCELLATIONS_RTA CANCEL LATE_TRIPS TRIPS_DATA; do
             echo "$d: $(find "$d" -name '*.csv' | wc -l) ficheros"
           done
 
@@ -115,7 +142,7 @@ jobs:
           # Solo se suben a Supabase los días que de verdad pueden haber
           # cambiado (las descargas traen --max-age 3d). Para un rebackfill
           # completo, lanza el workflow a mano y sube este número a 21.
-          SUPABASE_SYNC_DAYS: '21'
+          SUPABASE_SYNC_DAYS: ${{ inputs.dias_supabase || '21' }}
 
       - name: Tamaño de la salida
         run: |

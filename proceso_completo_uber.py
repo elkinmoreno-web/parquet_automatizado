@@ -960,6 +960,13 @@ _COLUMNAS_DESTINO_SUPABASE = [
     'tph', 'pct_accept', 'pct_cancel',
 ]
 
+# Columnas que usa «Variables en Vivo» del CRM (retrasos, mercado, vehículo y km del
+# día). Necesitan supabase/sql/20261026_variables_vivo.sql del CRM: si la tabla aún
+# no las tiene, la subida sigue sin ellas en vez de fallar.
+_COLUMNAS_VIVO_SUPABASE = [
+    'market_name', 'form_factor', 'late_p2_trips', 'late_p3_trips', 'total_km',
+]
+
 
 def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
     """
@@ -995,10 +1002,11 @@ def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
         (pl.col('pct_cancelacion') / 100.0).alias('pct_cancel'),
     ])
 
-    for col in _COLUMNAS_DESTINO_SUPABASE:
+    columnas = _COLUMNAS_DESTINO_SUPABASE + _COLUMNAS_VIVO_SUPABASE
+    for col in columnas:
         if col not in df.columns:
             df = df.with_columns(pl.lit(None).alias(col))
-    df = df.select(_COLUMNAS_DESTINO_SUPABASE)
+    df = df.select(columnas)
 
     if 'day' in df.columns:
         limite = date.today() - timedelta(days=ventana_dias)
@@ -1016,7 +1024,17 @@ def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
     subidos = 0
     for i in range(0, len(registros), TAMANO_LOTE):
         lote = registros[i:i + TAMANO_LOTE]
-        supabase.table('driver_daily_stats').upsert(lote, on_conflict='courier_uuid,day').execute()
+        try:
+            supabase.table('driver_daily_stats').upsert(lote, on_conflict='courier_uuid,day').execute()
+        except Exception as e:
+            # Solo se tolera que falten las columnas de «Variables en Vivo»: cualquier otro error para el run.
+            if i > 0 or not any(c in str(e) for c in _COLUMNAS_VIVO_SUPABASE):
+                raise
+            print(f'[sync_to_supabase] ⚠ driver_daily_stats aún no tiene las columnas de Variables en Vivo '
+                  f'({e}); se suben sin ellas. Aplica supabase/sql/20261026_variables_vivo.sql en el CRM.')
+            registros = [{k: v for k, v in r.items() if k not in _COLUMNAS_VIVO_SUPABASE} for r in registros]
+            lote = registros[i:i + TAMANO_LOTE]
+            supabase.table('driver_daily_stats').upsert(lote, on_conflict='courier_uuid,day').execute()
         subidos += len(lote)
         print(f'[sync_to_supabase] {subidos}/{len(registros)} filas sincronizadas')
 
@@ -1047,6 +1065,174 @@ def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
     ).execute()
     print(f'[sync_to_supabase] Dias marcados como cerrados: {len(conteos)} -> {sorted(conteos)}')
     # -------------------------------------------------------------------------
+
+
+# =============================================================================
+# 4.6. EVENTOS POR PEDIDO (CANCEL y LATE_TRIPS) → Supabase
+# =============================================================================
+# Los usa «Variables en Vivo» del CRM: detalle de cancelaciones y rechazos para los
+# gestores y cruce de las incidencias con los pedidos de Uber. No pasan por el bronce:
+# se suben los CSV recién bajados (--max-age 3d) y el UPSERT por pedido los deja al día.
+# El día lleva la misma regla de las 02:00 que las métricas diarias.
+
+CANCEL_DIR = os.environ.get('CANCEL_DIR', 'CANCEL')
+LATE_DIR = os.environ.get('LATE_DIR', 'LATE_TRIPS')
+CANCEL_PATTERN = re.compile(r'^CANCEL_.*\.csv$', re.IGNORECASE)
+LATE_PATTERN = re.compile(r'LATE.*\.csv$', re.IGNORECASE)
+TIPOS_EVENTO = ['CANCEL', 'CANCEL_NOT_AT_FAULT', 'REJECT']
+
+CANCEL_COLS = ['hour', 'driver_uuid', 'delivery_trip_uuid', 'order_id', 'event_type',
+               'cancellation_reason_name', 'form_factor']
+LATE_COLS = ['driver_uuid', 'delivery_trip_uuid', 'order_id', 'courier_accept_timestamp_local',
+             'actual_p2_driving', 'estimated_p2_driving', 'actual_p3_driving', 'estimated_p3_driving']
+
+
+def _leer_csvs_eventos(carpeta, patron, columnas, etiqueta):
+    """Une los CSV de una carpeta con las columnas pedidas y la fecha del fichero (para quedarse con el último)."""
+    frames, errores, total = [], 0, 0
+    for path in sorted(glob.glob(os.path.join(carpeta, '*.csv'))):
+        name = os.path.basename(path)
+        if not patron.search(name):
+            continue
+        total += 1
+        try:
+            df = pl.read_csv(path, separator=detect_sep(path), infer_schema=False,
+                             null_values=['', 'NA', 'null', 'NULL', '\\N'], truncate_ragged_lines=True)
+        except Exception as e:
+            errores += 1
+            print(f'[{etiqueta}] {name}: ERROR {e}')
+            continue
+        faltan = [c for c in columnas if c not in df.columns]
+        if faltan:
+            errores += 1
+            print(f'[{etiqueta}] {name}: faltan columnas {faltan}')
+            continue
+        frames.append(df.select(columnas).with_columns(
+            pl.lit(extract_ts(name) or datetime(1970, 1, 1)).alias('_ts_fichero')))
+    avisar_errores(etiqueta, errores, total)
+    return pl.concat(frames, how='vertical_relaxed') if frames else None
+
+
+def _dia_logico(columna):
+    """Fecha del día lógico: lo de antes de las 02:00 cuenta para el día anterior."""
+    ts = pl.col(columna).str.to_datetime(strict=False)
+    return (pl.when(ts.dt.hour() < LOGICAL_DAY_CUTOFF_HOUR)
+              .then(ts - timedelta(days=1))
+              .otherwise(ts)).dt.date()
+
+
+def eventos_cancel(cancel):
+    """Un registro por (rider, pedido de reparto, tipo de evento), del CSV más reciente."""
+    ev = (cancel
+          .filter(pl.col('event_type').is_in(TIPOS_EVENTO)
+                  & pl.col('driver_uuid').is_not_null() & pl.col('delivery_trip_uuid').is_not_null())
+          .with_columns(_dia_logico('hour').alias('day'))
+          .filter(pl.col('day').is_not_null())
+          .sort('_ts_fichero')
+          .unique(subset=['driver_uuid', 'delivery_trip_uuid', 'event_type'], keep='last'))
+    return ev.select([
+        pl.col('driver_uuid').alias('courier_uuid'), 'delivery_trip_uuid', 'event_type',
+        pl.col('day').cast(pl.Utf8), 'order_id', pl.col('cancellation_reason_name').alias('reason'), 'form_factor',
+    ]).to_dicts()
+
+
+def eventos_late(late):
+    """Un registro por (rider, pedido de reparto) con el retraso real − estimado de recogida (P2) y entrega (P3)."""
+    num = lambda c: pl.col(c).cast(pl.Float64, strict=False)
+    lt = (late
+          .filter(pl.col('driver_uuid').is_not_null() & pl.col('delivery_trip_uuid').is_not_null())
+          .with_columns([
+              _dia_logico('courier_accept_timestamp_local').alias('day'),
+              (num('actual_p2_driving') - num('estimated_p2_driving')).alias('retraso_p2'),
+              (num('actual_p3_driving') - num('estimated_p3_driving')).alias('retraso_p3'),
+          ])
+          .filter(pl.col('day').is_not_null())
+          .sort('_ts_fichero')
+          .unique(subset=['driver_uuid', 'delivery_trip_uuid'], keep='last'))
+    return lt.select([
+        pl.col('driver_uuid').alias('courier_uuid'), 'delivery_trip_uuid',
+        pl.col('day').cast(pl.Utf8), 'order_id', 'retraso_p2', 'retraso_p3',
+    ]).to_dicts()
+
+
+# Km de cada pedido (informe TRIPS_DATA de Uber) para el plus de larga distancia: actual_pickup_dropoff_km
+# (tienda → cliente) de los pedidos entregados (delivery_status COMPLETED). Cada fichero trae los últimos
+# ~5 días; el día del pedido es el de la aceptación, con la regla de las 02:00. Cada dato se busca entre
+# varios nombres posibles y el fichero se descarta (con aviso) si falta alguno.
+TRIPS_DIR = os.environ.get('TRIPS_DIR', 'TRIPS_DATA')
+TRIPS_PATTERN = re.compile(r'trips.*\.csv$', re.IGNORECASE)
+TRIPS_CANDIDATAS = {
+    'courier_uuid': ['driver_uuid', 'courier_uuid'],
+    'trip_uuid': ['delivery_trip_uuid', 'trip_uuid', 'workflow_uuid', 'job_uuid', 'order_uuid'],
+    'momento': ['courier_accept_timestamp_local', 'courier_begintrip_timestamp_local', 'courier_dropoff_timestamp_local', 'day_date', 'datestr'],
+    'km': ['actual_pickup_dropoff_km', 'pickup_dropoff_km', 'distance_km'],
+}
+
+
+def _leer_csvs_trips():
+    frames, errores, total = [], 0, 0
+    for path in sorted(glob.glob(os.path.join(TRIPS_DIR, '*.csv'))):
+        name = os.path.basename(path)
+        if not TRIPS_PATTERN.search(name):
+            continue
+        total += 1
+        try:
+            df = pl.read_csv(path, separator=detect_sep(path), infer_schema=False,
+                             null_values=['', 'NA', 'null', 'NULL', '\\N'], truncate_ragged_lines=True)
+        except Exception as e:
+            errores += 1
+            print(f'[trips] {name}: ERROR {e}')
+            continue
+        elegidas = {k: next((c for c in v if c in df.columns), None) for k, v in TRIPS_CANDIDATAS.items()}
+        faltan = [k for k, c in elegidas.items() if c is None]
+        if faltan:
+            errores += 1
+            print(f'[trips] {name}: no encuentro {faltan} (columnas: {df.columns[:30]})')
+            continue
+        if 'delivery_status' in df.columns:
+            df = df.filter(pl.col('delivery_status') == 'COMPLETED')
+        cols = [pl.col(c).alias(k) for k, c in elegidas.items()]
+        cols.append((pl.col('form_factor') if 'form_factor' in df.columns else pl.lit(None, dtype=pl.Utf8)).alias('form_factor'))
+        frames.append(df.select(cols).with_columns(pl.lit(extract_ts(name) or datetime(1970, 1, 1)).alias('_ts_fichero')))
+    avisar_errores('trips', errores, total)
+    return pl.concat(frames, how='vertical_relaxed') if frames else None
+
+
+def pedidos_km(trips):
+    """Un registro por (rider, pedido) con los km tienda → cliente y el día lógico (regla de las 02:00)."""
+    t = (trips
+         .with_columns([_dia_logico('momento').alias('day'), pl.col('km').cast(pl.Float64, strict=False)])
+         .filter(pl.col('courier_uuid').is_not_null() & pl.col('trip_uuid').is_not_null()
+                 & pl.col('day').is_not_null() & pl.col('km').is_not_null())
+         .sort('_ts_fichero')
+         .unique(subset=['courier_uuid', 'trip_uuid'], keep='last'))
+    return t.select(['courier_uuid', 'trip_uuid', pl.col('day').cast(pl.Utf8), 'km', 'form_factor']).to_dicts()
+
+
+def sync_eventos_pedido():
+    cancel = _leer_csvs_eventos(CANCEL_DIR, CANCEL_PATTERN, CANCEL_COLS, 'cancel')
+    late = _leer_csvs_eventos(LATE_DIR, LATE_PATTERN, LATE_COLS, 'late')
+    trips = _leer_csvs_trips()
+    if cancel is None and late is None and trips is None:
+        print('[eventos] Sin CSV de CANCEL, LATE_TRIPS ni TRIPS_DATA: nada que subir.')
+        return
+
+    supabase = create_client(os.environ['SUPABASE_METRICS_URL'], os.environ['SUPABASE_METRICS_SERVICE_KEY'])
+    for tabla, registros, conflicto in [
+        ('uber_eventos_pedido', eventos_cancel(cancel) if cancel is not None else [], 'courier_uuid,delivery_trip_uuid,event_type'),
+        ('uber_retrasos_pedido', eventos_late(late) if late is not None else [], 'courier_uuid,delivery_trip_uuid'),
+        ('uber_pedidos_km', pedidos_km(trips) if trips is not None else [], 'courier_uuid,trip_uuid'),
+    ]:
+        try:
+            for i in range(0, len(registros), 1000):
+                supabase.table(tabla).upsert(registros[i:i + 1000], on_conflict=conflicto).execute()
+        except Exception as e:
+            # La tabla la crea supabase/sql/20261026_variables_vivo.sql del CRM; sin ella no se para el pipeline.
+            if tabla in str(e):
+                print(f'::warning::[eventos] No existe {tabla} en Supabase ({e}). Aplica 20261026_variables_vivo.sql en el CRM.')
+                continue
+            raise
+        print(f'[eventos] {tabla}: {len(registros):,} filas sincronizadas')
 
 
 # =============================================================================
@@ -1149,6 +1335,12 @@ def main():
 
     # --- Sincronizar el resultado a Supabase (reemplaza a la API Fleet Manager) ---
     sync_to_supabase(final)
+
+    # --- Eventos por pedido para «Variables en Vivo» (no paran las métricas si fallan) ---
+    try:
+        sync_eventos_pedido()
+    except Exception as e:
+        print(f'::warning::[eventos] No se han podido subir los eventos por pedido: {e}')
 
     # --- Chequeo de integridad: una sola fila por (rider, día) ---
     dups = (final.with_columns(pl.col('datestr').dt.date().alias('_d'))
