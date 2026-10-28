@@ -2,13 +2,22 @@
 """
 Pipeline Closer Logistics — Viajes + Connections con regla de las 02:00
 =======================================================================
-VERSIÓN: v5.5-cierre-dia  (2026-09-24)
+VERSIÓN: v5.6-retrasos  (2026-10-28)
 
   TODO se calcula desde Connections (viajes, horas, aceptados, cancelados,
   % aceptación, % cancelación). El silver solo aporta metadatos del rider.
   Días sin cobertura de Connections se descartan.
 
-CAMBIOS DE ESTA VERSIÓN (v5.5) — ver comentarios marcados [FIX 6] y [FIX 7]:
+CAMBIOS DE ESTA VERSIÓN (v5.6) — ver comentarios marcados [FIX 8] y [FIX 9]:
+
+  [FIX 8] Retrasos: se deja de guardar la medida nueva de Uber (p2_late /
+          p3_late) como si fuera la antigua, y la antigua se rehace por
+          pedido desde TRIPS_DATA.
+  [FIX 9] La madrugada contaba dos veces: el primer día subido no la movía
+          (el silver empieza ahora un día antes) y los días que la regla
+          de las 02:00 deja vacíos seguían en driver_daily_stats (se borran).
+
+CAMBIOS DE LA VERSIÓN v5.5 — ver comentarios marcados [FIX 6] y [FIX 7]:
 
   [FIX 6] El pipeline marca cada día como CERRADO al terminar de subirlo.
   [FIX 7] Un aborto por falta de datos sale en ROJO en GitHub Actions.
@@ -31,7 +40,7 @@ CAMBIOS DE LA VERSIÓN ANTERIOR (v5.4) — comentarios marcados [FIX 1..5]:
   que se desmadraba era online_hours, porque se sustituía sola.
 """
 
-PIPELINE_VERSION = "v5.5-cierre-dia"
+PIPELINE_VERSION = "v5.6-retrasos"
 
 import os
 import sys
@@ -186,11 +195,23 @@ DAILY_TEXT = {'driver_uuid', 'driver_name', 'driver_number', 'driver_email',
 DAILY_DATE = {'weekstr', 'datestr'}
 
 
-# El 13/10/2026 (12:09) Uber cambió los retrasos de COURIER_DAILY: quitó late_p2_trips / late_p3_trips y
-# puso p2_on_time / p2_late / OTR_p2 (y lo mismo para P3). Es otra medida: «late» es ahora todo pedido que no
-# llega a tiempo (unas 30 veces más que antes). Se guarda en las mismas columnas; el CRM decide con su
-# configuración cuántos retrasos por semana cuentan.
-DAILY_RENOMBRAR = {'p2_late': 'late_p2_trips', 'p3_late': 'late_p3_trips'}
+# ---------------------------------------------------------------------- [FIX 8]
+# Retrasos diarios (late_p2_trips / late_p3_trips).
+#
+# Desde el 13/10/2026 (12:09) COURIER_DAILY ya no trae estas columnas: trae
+# p2_on_time / p2_late / OTR_p2 (y lo mismo para P3), y las re-exportaciones
+# llevan la medida nueva a los días desde el 6/10. Es OTRA medida: «late» es
+# todo pedido que llega después de la hora prevista, por poco que sea (del
+# 1-1,5 % de los viajes se pasa al 17 %). La antigua contaba los pedidos
+# sueltos que pasaban de 10 min sobre lo estimado.
+#
+# Antes p2_late se guardaba en late_p2_trips y el CRM la tomaba por la
+# antigua: el 75 % de los riders de octubre salía con retrasos. Ahora estas
+# columnas se quedan VACÍAS (no 0) en los ficheros nuevos, y el CRM cuenta
+# los retrasos de cada pedido de uber_retrasos_pedido (ver retrasos_trips).
+# Para vaciar lo que ya está en el bronce, una ejecución con
+# REPROCESAR_DAILY_DESDE=2026-10-13.
+COLS_RETRASO_DIARIO = ['late_p2_trips', 'late_p3_trips']
 
 
 def parse_daily_csv(filepath, file_name, file_ts):
@@ -200,7 +221,6 @@ def parse_daily_csv(filepath, file_name, file_ts):
         try_parse_dates=False, null_values=['', 'NA', 'null', 'NULL', '\\N'],
         truncate_ragged_lines=True,
     )
-    df = df.rename({a: b for a, b in DAILY_RENOMBRAR.items() if a in df.columns and b not in df.columns})
     for col in CANONICAL_DAILY:
         if col not in df.columns:
             if col in DAILY_DATE:   df = df.with_columns(pl.lit(None).cast(pl.Datetime).alias(col))
@@ -650,7 +670,9 @@ def build_silver(bronze_daily):
         'fleet_name', 'city_id', 'city_name', 'market_name', 'form_factor',
     ] if c in base.columns]
 
-    aggs = [pl.col(c).sum().alias(c) for c in SUM_COLS]
+    # Los retrasos diarios se quedan vacíos si ninguna fila los trae (sum() daría 0): ver [FIX 8].
+    aggs = [(pl.when(pl.col(c).is_not_null().any()).then(pl.col(c).sum()) if c in COLS_RETRASO_DIARIO
+             else pl.col(c).sum()).alias(c) for c in SUM_COLS]
     aggs += [pl.col(c).first().alias(c) for c in FIRST_COLS]
 
     silver = (
@@ -681,9 +703,14 @@ def build_silver(bronze_daily):
 
     # Recorte a la ventana reciente para reprocesar rápido. Nunca menos que los días que se suben a Supabase
     # (SUPABASE_SYNC_DAYS): si no, un relleno a mano de 60 días solo subiría las últimas 3 semanas.
+    # [FIX 9] Y un día MÁS que la subida: el primer día que se sube necesita su día anterior para pasarle la
+    # madrugada (apply_adjustment no mueve nada sin D-1). Con max_day = hoy y 21 días de subida, el primer día
+    # subido era el borde del silver: se volvía a subir SIN mover su madrugada, que ya estaba sumada en D-1 (subido
+    # días antes y ya fuera de la ventana). Contaba dos veces para siempre, y un día vaciado volvía a aparecer.
     max_day = silver.select(pl.col('datestr').max()).item()
     if max_day is not None:
-        cutoff = max_day - max(timedelta(weeks=REPROCESS_WEEKS), timedelta(days=int(os.environ.get('SUPABASE_SYNC_DAYS', '7'))))
+        cutoff = max_day - max(timedelta(weeks=REPROCESS_WEEKS), timedelta(days=int(os.environ.get('SUPABASE_SYNC_DAYS', '7')))) \
+                 - timedelta(days=1)
         silver = silver.filter(pl.col('datestr') >= cutoff)
         print(f"[silver] Ventana: {cutoff.date()} → {max_day.date()} ({len(silver):,} filas)")
     return silver
@@ -895,9 +922,11 @@ def apply_adjustment(silver, rta, conn):
     # sin mover viajes). Con una sola fracción, viajes y horas se mueven juntos.
     #   - HORAS: proporción exacta (decimal)
     #   - PEDIDOS: proporción redondeada al entero (no hay medios viajes)
+    # Los retrasos diarios vacíos se quedan vacíos, no pasan a 0 (ver [FIX 8]).
+    valor = lambda c: pl.col(c) if c in COLS_RETRASO_DIARIO else pl.col(c).fill_null(0)
     mv_exprs = []
     for c in PEDIDO_COLS:
-        mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_horas')).round(0).alias('mv_' + c))
+        mv_exprs.append((valor(c) * pl.col('frac_horas')).round(0).alias('mv_' + c))
     for c in HORA_COLS:
         mv_exprs.append((pl.col(c).fill_null(0) * pl.col('frac_horas')).alias('mv_' + c))
     s = s.with_columns(mv_exprs)
@@ -915,7 +944,7 @@ def apply_adjustment(silver, rta, conn):
     # --- Restar de cada día lo que sale, sumar lo que entra ---
     # Primero restamos
     s = s.with_columns(
-        [(pl.col(c).fill_null(0) - pl.col('mv_' + c)).alias(c) for c in PEDIDO_COLS + HORA_COLS]
+        [(valor(c) - pl.col('mv_' + c)).alias(c) for c in PEDIDO_COLS + HORA_COLS]
     )
     # Unimos lo que entra del día siguiente
     s = s.join(movidos, on=['driver_uuid', '_dia'], how='left')
@@ -990,10 +1019,59 @@ _COLUMNAS_VIVO_SUPABASE = [
 ]
 
 
-def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
+def filas_vaciadas(final: pl.DataFrame) -> pl.DataFrame:
+    """
+    (courier_uuid, day) que la regla de las 02:00 ha dejado a 0 viajes y 0 horas: todo el trabajo de ese día
+    era de madrugada y ha pasado al día anterior. main() las quita de la salida. Se llaman ANTES de quitarlas.
+    """
+    if '_frac_horas_dbg' not in final.columns:
+        return pl.DataFrame(schema={'courier_uuid': pl.Utf8, 'day': pl.Date})
+    return (final
+            .filter((pl.col('_frac_horas_dbg') > 0)
+                    & (pl.col('num_of_trips').fill_null(0) == 0) & (pl.col('online_hours').fill_null(0) == 0))
+            .select([pl.col('driver_uuid').alias('courier_uuid'), pl.col('datestr').dt.date().alias('day')])
+            .unique())
+
+
+def borrar_filas_vaciadas(supabase, vaciadas: pl.DataFrame, limite: date, subidas=frozenset()) -> None:
+    """
+    [FIX 9] Borra de driver_daily_stats las filas que la regla de las 02:00 ha vaciado.
+
+    Una ejecución anterior pudo subir el día D tal cual: aún no había llegado
+    Connections de D, o D era el borde del silver y no se movía nada (ver el
+    recorte de build_silver). Cuando se mueve, todo D pasa a D-1 y D se queda
+    a 0/0, así que ya no se sube; pero como la subida solo hace UPSERT, la
+    fila vieja de D seguía en la tabla y ese trabajo contaba DOS veces, en D-1
+    y en D. Medido: 120 (rider, día) en octubre (118 en los días 2-7, los
+    bordes de las ejecuciones del 23 al 28/10) y 534 en septiembre.
+
+    Solo se borran esas claves, y solo si D-1 también está en la ventana de
+    esta subida (D > límite): así D-1 ya lleva lo movido cuando D desaparece.
+    Nunca una clave que esta misma ejecución acaba de subir ('subidas', «uuid|AAAA-MM-DD»).
+    """
+    if vaciadas is None or len(vaciadas) == 0:
+        return
+    clave = pl.col('courier_uuid') + '|' + pl.col('day').cast(pl.Utf8)
+    por_dia = (vaciadas
+               .filter((pl.col('day') > limite) & ~clave.is_in(pl.Series(list(subidas), dtype=pl.Utf8)))
+               .group_by('day').agg(pl.col('courier_uuid').unique()))
+    candidatas = borradas = 0
+    for dia, uuids in por_dia.sort('day').iter_rows():
+        for i in range(0, len(uuids), 100):
+            lote = uuids[i:i + 100]
+            r = supabase.table('driver_daily_stats').delete().eq('day', dia.isoformat()).in_('courier_uuid', lote).execute()
+            candidatas += len(lote)
+            borradas += len(r.data or [])
+    if candidatas:
+        print(f'[sync_to_supabase] Días vaciados por la regla de las 02:00: {borradas} filas borradas '
+              f'de {candidatas} (rider, día) en {len(por_dia)} días')
+
+
+def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None, vaciadas: pl.DataFrame = None) -> None:
     """
     Sube a Supabase solo la ventana reciente. El UPSERT por (courier_uuid, day)
     cubre que los días de la ventana se sobrescriban con el dato más reciente.
+    Después borra los (rider, día) de 'vaciadas' (ver borrar_filas_vaciadas).
 
     La ventana por defecto son 7 días, no 21: las descargas traen --max-age 3d,
     así que más allá de ~4 días NADA puede haber cambiado. Subir 21 días en
@@ -1030,8 +1108,8 @@ def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
             df = df.with_columns(pl.lit(None).alias(col))
     df = df.select(columnas)
 
+    limite = date.today() - timedelta(days=ventana_dias)
     if 'day' in df.columns:
-        limite = date.today() - timedelta(days=ventana_dias)
         df = df.filter(pl.col('day') >= limite)
 
     registros = df.with_columns(pl.col('day').cast(pl.Utf8)).to_dicts()
@@ -1061,6 +1139,9 @@ def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
         print(f'[sync_to_supabase] {subidos}/{len(registros)} filas sincronizadas')
 
     print(f'[sync_to_supabase] {subidos} filas sincronizadas a Supabase (ventana: ultimos {ventana_dias} dias)')
+
+    # Antes de marcar los días como cerrados: el CRM no debe leer un día "listo" con filas duplicadas.
+    borrar_filas_vaciadas(supabase, vaciadas, limite, {f"{r['courier_uuid']}|{r['day']}" for r in registros})
 
     # ------------------------------------------------------------------ [FIX 6]
     # Marca de "dia cerrado" en la tabla pipeline_cargas.
@@ -1094,7 +1175,8 @@ def sync_to_supabase(final: pl.DataFrame, ventana_dias: int = None) -> None:
 # =============================================================================
 # Los usa «Variables en Vivo» del CRM: detalle de cancelaciones y rechazos para los
 # gestores y cruce de las incidencias con los pedidos de Uber. No pasan por el bronce:
-# se suben los CSV recién bajados (--max-age 3d) y el UPSERT por pedido los deja al día.
+# se suben los CSV recién bajados (--max-age 3d, o desde 'retrasos_desde' si el workflow
+# se lanza a mano) y el UPSERT por pedido los deja al día.
 # El día lleva la misma regla de las 02:00 que las métricas diarias.
 
 CANCEL_DIR = os.environ.get('CANCEL_DIR', 'CANCEL')
@@ -1158,8 +1240,17 @@ def eventos_cancel(cancel):
     ]).to_dicts()
 
 
+# Retraso a partir del cual un tramo contaba en la medida antigua: más de 10 min sobre lo estimado.
+UMBRAL_RETRASO_MIN = 10
+
+
 def eventos_late(late):
-    """Un registro por (rider, pedido de reparto) con el retraso real − estimado de recogida (P2) y entrega (P3)."""
+    """
+    Un registro por (rider, pedido de reparto) con el retraso real − estimado de recogida (P2) y entrega (P3).
+    LATE_TRIPS da los tiempos en SEGUNDOS y lista el pedido si un tramo pasa de 10 min (600 s); el otro tramo
+    viene con su retraso real, que puede ser pequeño. Por eso tarde_p2 / tarde_p3 son > 600 s, como contaban los
+    contadores diarios antiguos (cuadran con ellos en el 99,4 % de los (rider, día) de P2 y el 99,8 % de P3).
+    """
     num = lambda c: pl.col(c).cast(pl.Float64, strict=False)
     lt = (late
           .filter(pl.col('driver_uuid').is_not_null() & pl.col('delivery_trip_uuid').is_not_null())
@@ -1174,7 +1265,8 @@ def eventos_late(late):
     return lt.select([
         pl.col('driver_uuid').alias('courier_uuid'), 'delivery_trip_uuid',
         pl.col('day').cast(pl.Utf8), 'order_id', 'retraso_p2', 'retraso_p3',
-        (pl.col('retraso_p2') > 0).fill_null(False).alias('tarde_p2'), (pl.col('retraso_p3') > 0).fill_null(False).alias('tarde_p3'),
+        (pl.col('retraso_p2') > UMBRAL_RETRASO_MIN * 60).fill_null(False).alias('tarde_p2'),
+        (pl.col('retraso_p3') > UMBRAL_RETRASO_MIN * 60).fill_null(False).alias('tarde_p3'),
     ]).to_dicts()
 
 
@@ -1184,10 +1276,19 @@ def eventos_late(late):
 # varios nombres posibles y el fichero se descarta (con aviso) si falta alguno.
 TRIPS_DIR = os.environ.get('TRIPS_DIR', 'TRIPS_DATA')
 TRIPS_PATTERN = re.compile(r'trips.*\.csv$', re.IGNORECASE)
-# Columnas opcionales de TRIPS_DATA: los indicadores de puntualidad (desde mediados de octubre de 2026) y los
-# minutos real/estimado de recogida (P2) y entrega (P3), los mismos que traía LATE_TRIPS (allí en segundos).
+# Columnas opcionales de TRIPS_DATA: los indicadores de puntualidad (desde mediados de octubre de 2026), los
+# minutos real/estimado de recogida (P2) y entrega (P3), los mismos que traía LATE_TRIPS (allí en segundos), y lo
+# que hace falta para saber si un pedido iba suelto: si era de un lote y cuándo se aceptó y se entregó.
 TRIPS_OPCIONALES = ['order_id', 'p2_on_time', 'p3_on_time', 'pickup_approach_minutes', 'estimated_pickup_approach_minutes',
-                    'dropoff_approach_minutes', 'estimated_dropoff_approach_minutes']
+                    'dropoff_approach_minutes', 'estimated_dropoff_approach_minutes',
+                    'batch_order', 'courier_accept_timestamp_local', 'courier_dropoff_timestamp_local']
+# Sin alguna de estas, todo saldría «a tiempo» y el UPSERT borraría retrasos buenos: el fichero no se usa para ellos.
+TRIPS_MEDIDA_RETRASO = ['batch_order', 'courier_accept_timestamp_local', 'courier_dropoff_timestamp_local',
+                        'pickup_approach_minutes', 'estimated_pickup_approach_minutes',
+                        'dropoff_approach_minutes', 'estimated_dropoff_approach_minutes']
+# Hasta el 11/10/2026 están los pedidos del informe LATE_TRIPS (el último, del 13/10 a las 12:09, llega a ese día):
+# es la medida antigua exacta. Desde TRIPS_DATA solo se calculan los días siguientes, para no pisarlos.
+PRIMER_DIA_SIN_LATE_TRIPS = date(2026, 10, 12)
 TRIPS_CANDIDATAS = {
     'courier_uuid': ['driver_uuid', 'courier_uuid'],
     'trip_uuid': ['delivery_trip_uuid', 'trip_uuid', 'workflow_uuid', 'job_uuid', 'order_uuid'],
@@ -1237,23 +1338,85 @@ def pedidos_km(trips):
     return t.select(['courier_uuid', 'trip_uuid', pl.col('day').cast(pl.Utf8), 'km', 'form_factor']).to_dicts()
 
 
-def retrasos_trips(trips):
+def marcar_retrasos_trips(trips):
     """
-    Pedidos que Uber marca fuera de hora (p2_on_time / p3_on_time = 0): lo que cuentan sus contadores diarios
-    p2_late / p3_late desde el 13/10/2026, cuando dejó de mandar LATE_TRIPS. Mismo formato que eventos_late
-    más las marcas tarde_p2 / tarde_p3 (la marca de Uber, no el signo de los minutos).
+    [FIX 8] Todos los pedidos entregados de cada fichero de TRIPS_DATA, marcados con la medida ANTIGUA de retraso:
+    la del informe LATE_TRIPS (que Uber dejó de mandar el 13/10/2026) y la de los contadores diarios antiguos.
+    Un tramo (P2 recogida, P3 entrega) va tarde si:
+      - el pedido iba suelto (batch_order = 'NO BATCH'),
+      - y no encadenado: se aceptó cuando el rider ya había entregado todos sus pedidos anteriores,
+      - y pasó de 10 min sobre lo estimado (approach − estimated_approach),
+      - y Uber lo marca fuera de hora (p2_on_time / p3_on_time = 0).
+
+    Medido con el fichero del 13/10 sobre los días 9-11/10, frente al informe antiguo: 688 retrasos P2 (el
+    informe, 697; coinciden 610) y 512 P3 (517; coinciden 432). La marca nueva de Uber sola da 16.471 en P2
+    (todo pedido que llega después de la hora prevista, por poco que sea), y ningún umbral sobre ella se parece
+    a la medida antigua.
+
+    El encadenado se calcula sobre el fichero ENTERO, por rider y en orden de aceptación. Después se marca en
+    '_dia_valido' qué días del fichero se pueden usar:
+      - el primero no (le faltan los pedidos de antes para saber si había cadena),
+      - el último tampoco,
+      - ni ningún día cuya marca de Uber siga casi vacía: Uber la rellena con un día de retraso. En el fichero
+        del 13/10 a las 12:12, el 12/10 la tiene en 50 de 32.000 pedidos.
+    Cada día queda como día del medio en el fichero de uno o dos días después.
     """
     num = lambda c: pl.col(c).cast(pl.Float64, strict=False)
     t = (trips
-         .filter((pl.col('p2_on_time') == '0').fill_null(False) | (pl.col('p3_on_time') == '0').fill_null(False))
+         .filter(pl.col('courier_uuid').is_not_null() & pl.col('trip_uuid').is_not_null())
          .with_columns([
+             pl.col('courier_accept_timestamp_local').str.to_datetime(strict=False).alias('_acepta'),
+             pl.col('courier_dropoff_timestamp_local').str.to_datetime(strict=False).alias('_entrega'),
              _dia_logico('momento').alias('day'),
-             (num('pickup_approach_minutes') - num('estimated_pickup_approach_minutes')).alias('retraso_p2'),
-             (num('dropoff_approach_minutes') - num('estimated_dropoff_approach_minutes')).alias('retraso_p3'),
-             (pl.col('p2_on_time') == '0').fill_null(False).alias('tarde_p2'),
-             (pl.col('p3_on_time') == '0').fill_null(False).alias('tarde_p3'),
          ])
-         .filter(pl.col('courier_uuid').is_not_null() & pl.col('trip_uuid').is_not_null() & pl.col('day').is_not_null())
+         .filter(pl.col('_acepta').is_not_null() & pl.col('day').is_not_null())
+         # El mismo pedido puede venir dos veces en un fichero (solo cambia la propina): no es una cadena.
+         .unique(subset=['_ts_fichero', 'courier_uuid', 'trip_uuid'], keep='first', maintain_order=True)
+         .sort(['_ts_fichero', 'courier_uuid', '_acepta'], maintain_order=True))
+
+    # Encadenado: aceptado antes de la última entrega de sus pedidos anteriores (mismo rider, mismo fichero).
+    # Una entrega vacía cuenta como la propia aceptación, para no cortar el máximo acumulado.
+    entrega_previa = (pl.col('_entrega').fill_null(pl.col('_acepta')).shift(1).cum_max()
+                      .over(['_ts_fichero', 'courier_uuid']))
+    suelto = (pl.col('batch_order') == 'NO BATCH') & ~(pl.col('_acepta') < entrega_previa).fill_null(False)
+    t = t.with_columns([
+        suelto.fill_null(False).alias('_suelto'),
+        (num('pickup_approach_minutes') - num('estimated_pickup_approach_minutes')).alias('retraso_p2'),
+        (num('dropoff_approach_minutes') - num('estimated_dropoff_approach_minutes')).alias('retraso_p3'),
+    ]).with_columns([
+        (pl.col('_suelto') & (pl.col('retraso_p2') > UMBRAL_RETRASO_MIN) & (pl.col('p2_on_time') == '0'))
+        .fill_null(False).alias('tarde_p2'),
+        (pl.col('_suelto') & (pl.col('retraso_p3') > UMBRAL_RETRASO_MIN) & (pl.col('p3_on_time') == '0'))
+        .fill_null(False).alias('tarde_p3'),
+    ])
+
+    fichero, dia = ['_ts_fichero'], ['_ts_fichero', 'day']
+    completo = pl.all_horizontal([pl.col(c).is_not_null().any().over(fichero) for c in TRIPS_MEDIDA_RETRASO])
+    con_marca = (pl.col('p2_on_time').is_not_null() | pl.col('p3_on_time').is_not_null()).mean().over(dia) >= 0.5
+    t = t.with_columns(
+        (completo & con_marca
+         & (pl.col('day') > pl.col('day').min().over(fichero))
+         & (pl.col('day') < pl.col('day').max().over(fichero))).alias('_dia_valido'))
+
+    sin_medida = t.filter(~completo).select(pl.col('_ts_fichero').n_unique()).item()
+    if sin_medida:
+        print(f'::warning::[trips] {sin_medida} fichero(s) sin las columnas {TRIPS_MEDIDA_RETRASO}: '
+              'no se usan para los retrasos')
+    return t
+
+
+def retrasos_trips(trips):
+    """
+    [FIX 8] Retrasos por pedido desde TRIPS_DATA, con la medida antigua (ver marcar_retrasos_trips). Mismo
+    formato que eventos_late; aquí los minutos van en minutos (en LATE_TRIPS, en segundos).
+
+    Se suben los pedidos que Uber marca fuera de hora (p2_on_time / p3_on_time = 0), los mismos que subía la
+    versión anterior con la marca de Uber tal cual: así el UPSERT corrige esas filas, también a false. Solo días
+    válidos del fichero y desde PRIMER_DIA_SIN_LATE_TRIPS; de cada pedido manda el fichero más reciente.
+    """
+    t = (marcar_retrasos_trips(trips)
+         .filter(((pl.col('p2_on_time') == '0') | (pl.col('p3_on_time') == '0')).fill_null(False)
+                 & pl.col('_dia_valido') & (pl.col('day') >= PRIMER_DIA_SIN_LATE_TRIPS))
          .sort('_ts_fichero')
          .unique(subset=['courier_uuid', 'trip_uuid'], keep='last'))
     return t.select([
@@ -1274,7 +1437,7 @@ def sync_eventos_pedido():
     for tabla, registros, conflicto in [
         ('uber_eventos_pedido', eventos_cancel(cancel) if cancel is not None else [], 'courier_uuid,delivery_trip_uuid,event_type'),
         ('uber_retrasos_pedido', eventos_late(late) if late is not None else [], 'courier_uuid,delivery_trip_uuid'),
-        # después de LATE_TRIPS: para un mismo pedido manda la marca de Uber
+        # después de LATE_TRIPS; no se pisan: TRIPS_DATA solo sube días desde PRIMER_DIA_SIN_LATE_TRIPS
         ('uber_retrasos_pedido', retrasos_trips(trips) if trips is not None else [], 'courier_uuid,delivery_trip_uuid'),
         ('uber_pedidos_km', pedidos_km(trips) if trips is not None else [], 'courier_uuid,trip_uuid'),
     ]:
@@ -1351,6 +1514,8 @@ def main():
             final = final.drop('_dia')
 
     # --- Quitar filas de días vacíos (0 viajes Y 0 horas) ---
+    # Las que ha vaciado la regla de las 02:00 se borran también de Supabase ([FIX 9]).
+    vaciadas = filas_vaciadas(final)
     antes = len(final)
     final = final.filter(
         ~((pl.col('num_of_trips').fill_null(0) == 0) &
@@ -1389,7 +1554,7 @@ def main():
     print(f"\n✓ Parquet final: {SILVER_PARQUET} ({len(final):,} filas)")
 
     # --- Sincronizar el resultado a Supabase (reemplaza a la API Fleet Manager) ---
-    sync_to_supabase(final)
+    sync_to_supabase(final, vaciadas=vaciadas)
 
     # --- Eventos por pedido para «Variables en Vivo» (no paran las métricas si fallan) ---
     try:

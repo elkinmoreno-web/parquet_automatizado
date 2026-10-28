@@ -16,11 +16,15 @@ on:
   workflow_dispatch:
     inputs:
       dias_supabase:
-        description: 'Días hacia atrás que se suben a Supabase (21 normalmente; 60 una vez para rellenar columnas nuevas)'
+        description: 'Días hacia atrás que se suben a Supabase (21 normalmente; 58 como mucho para rehacer más: el bronce guarda 60 días y el primer día subido necesita el anterior)'
         required: false
         default: '21'
       reprocesar_desde:
         description: 'Volver a leer los COURIER_DAILY desde esta fecha AAAA-MM-DD (vacío = no; 2026-10-13 una vez por el cambio de columnas de retrasos de Uber)'
+        required: false
+        default: ''
+      retrasos_desde:
+        description: 'Rehacer los retrasos por pedido (uber_retrasos_pedido) desde esta fecha AAAA-MM-DD: baja todos los LATE_TRIPS y el último TRIPS_DATA de cada día con fecha en el nombre desde ese día (vacío = no; 2026-10-13 una vez para rellenar del 12/10 en adelante)'
         required: false
         default: ''
 
@@ -48,8 +52,9 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     # Sin esto, un rclone colgado puede correr hasta 6 horas y quemar la cuota
-    # del plan gratis sin que nadie se entere.
-    timeout-minutes: 30
+    # del plan gratis sin que nadie se entere. El relleno de retrasos sube unas
+    # 5 veces más filas de pedidos: ese tiene 60.
+    timeout-minutes: ${{ inputs.retrasos_desde && 60 || 30 }}
 
     steps:
       # Deja escrita la hora REAL de arranque en el resumen del run: es la
@@ -77,6 +82,7 @@ jobs:
         shell: bash
         env:
           REPROCESAR_DESDE: ${{ inputs.reprocesar_desde }}
+          RETRASOS_DESDE: ${{ inputs.retrasos_desde }}
         run: |
           set -uo pipefail
 
@@ -96,6 +102,33 @@ jobs:
             rclone copy "gdrive:" "$1/" --drive-root-folder-id "$2" --include "/$ultimo" --stats-one-line --stats 30s
           }
 
+          # Relleno de retrasos (retrasos_desde): los CSV con fecha en el nombre (…_AAAAMMDD_HHMMSS.csv) desde
+          # RETRASOS_DESDE. $3 = 'todos', o 'ultimo_por_dia': de TRIPS_DATA basta el último de cada día, porque
+          # todos los del día traen los mismos días y el último manda (bajarlos todos son ~90 MB x 5 al día).
+          # Se ordena por la fecha y hora del nombre, no por el nombre entero (un prefijo distinto no cambia el último).
+          bajar_desde () {
+            local desde lista
+            desde=$(echo "$RETRASOS_DESDE" | tr -d '-')
+            lista=$(mktemp)
+            # Si el listado falla, la función falla (si no, bajaría 0 ficheros sin que saltara el aviso de abajo).
+            rclone lsf "gdrive:" --drive-root-folder-id "$2" --files-only > "$lista.todos" || return 1
+            grep -i '\.csv$' "$lista.todos" \
+              | while IFS= read -r f; do
+                  ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | tail -1)
+                  if [ -n "$ts" ] && [ "${ts:0:8}" -ge "$desde" ]; then echo "$ts|$f"; fi
+                done \
+              | sort \
+              | if [ "$3" = ultimo_por_dia ]; then awk -F'|' '{ u[substr($1, 1, 8)] = $2 } END { for (d in u) print u[d] }'; else cut -d'|' -f2-; fi \
+              > "$lista"
+            echo "$1: $(wc -l < "$lista") ficheros desde $RETRASOS_DESDE"
+            rclone copy "gdrive:" "$1/" --drive-root-folder-id "$2" --files-from "$lista" \
+              --transfers 8 --checkers 8 --stats-one-line --stats 30s
+          }
+
+          if [ -n "$RETRASOS_DESDE" ] && ! echo "$RETRASOS_DESDE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+            echo "::error::retrasos_desde debe ser AAAA-MM-DD (vacío = no)"; exit 1
+          fi
+
           # El bronce se baja a la vez que los CSV: no dependen entre sí.
           rclone copy "gdrive:" datos_salida/ \
             --drive-root-folder-id "$DRIVE_BRONZE" \
@@ -114,8 +147,13 @@ jobs:
           bajar_csv CANCELLATIONS_RTA "$DRIVE_CANCELLATIONS" & pid_rta=$!
           pid_cancel=''; pid_late=''; pid_trips=''
           [ -n "$DRIVE_CANCEL" ]     && { bajar_csv CANCEL     "$DRIVE_CANCEL"     & pid_cancel=$!; }
-          [ -n "$DRIVE_LATE_TRIPS" ] && { bajar_csv LATE_TRIPS "$DRIVE_LATE_TRIPS" & pid_late=$!; }
-          [ -n "$DRIVE_TRIPS" ]      && { bajar_ultimo TRIPS_DATA "$DRIVE_TRIPS"   & pid_trips=$!; }
+          if [ -n "$RETRASOS_DESDE" ]; then
+            [ -n "$DRIVE_LATE_TRIPS" ] && { bajar_desde LATE_TRIPS "$DRIVE_LATE_TRIPS" todos        & pid_late=$!; }
+            [ -n "$DRIVE_TRIPS" ]      && { bajar_desde TRIPS_DATA "$DRIVE_TRIPS" ultimo_por_dia     & pid_trips=$!; }
+          else
+            [ -n "$DRIVE_LATE_TRIPS" ] && { bajar_csv LATE_TRIPS "$DRIVE_LATE_TRIPS" & pid_late=$!; }
+            [ -n "$DRIVE_TRIPS" ]      && { bajar_ultimo TRIPS_DATA "$DRIVE_TRIPS"   & pid_trips=$!; }
+          fi
 
           # IMPORTANTE: 'wait PID' devuelve el estado real SOLO si lo último que
           # ejecuta el proceso de fondo es el propio rclone. Por eso se usan
@@ -154,7 +192,7 @@ jobs:
           SUPABASE_METRICS_SERVICE_KEY: ${{ secrets.SUPABASE_METRICS_SERVICE_KEY }}
           # Se suben a Supabase los últimos 21 días (Uber completa los días con
           # retraso). Para rellenar más (p. ej. columnas nuevas), lanza el
-          # workflow a mano con dias_supabase = 60.
+          # workflow a mano con dias_supabase = 58 (no más: ver el input).
           SUPABASE_SYNC_DAYS: ${{ inputs.dias_supabase || '21' }}
           REPROCESAR_DAILY_DESDE: ${{ inputs.reprocesar_desde }}
 
