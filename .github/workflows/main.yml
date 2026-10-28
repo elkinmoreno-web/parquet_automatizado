@@ -19,6 +19,10 @@ on:
         description: 'Días hacia atrás que se suben a Supabase (21 normalmente; 60 una vez para rellenar columnas nuevas)'
         required: false
         default: '21'
+      reprocesar_desde:
+        description: 'Volver a leer los COURIER_DAILY desde esta fecha AAAA-MM-DD (vacío = no; 2026-10-13 una vez por el cambio de columnas de retrasos de Uber)'
+        required: false
+        default: ''
 
 # Dos ejecuciones a la vez corromperían el bronce: las dos lo bajan, cada una
 # le añade cosas distintas, y la última en subir pisa el trabajo de la otra.
@@ -71,6 +75,8 @@ jobs:
 
       - name: Bajar bronce y CSVs recientes en paralelo
         shell: bash
+        env:
+          REPROCESAR_DESDE: ${{ inputs.reprocesar_desde }}
         run: |
           set -uo pipefail
 
@@ -96,7 +102,14 @@ jobs:
             --include "bronze_*.parquet" \
             --transfers 4 --checkers 8 --stats-one-line --stats 30s & pid_bronce=$!
 
-          bajar_csv COURIER_DAILY     "$DRIVE_COURIER"       & pid_courier=$!
+          if [ -n "$REPROCESAR_DESDE" ]; then
+            # todos los COURIER_DAILY desde esa fecha (el resto de carpetas, los 3 días de siempre)
+            dias=$(( ( $(date +%s) - $(date -d "$REPROCESAR_DESDE" +%s) ) / 86400 + 2 ))
+            rclone copy "gdrive:" COURIER_DAILY/ --drive-root-folder-id "$DRIVE_COURIER" \
+              --transfers 12 --checkers 12 --fast-list --max-age "${dias}d" --stats-one-line --stats 30s & pid_courier=$!
+          else
+            bajar_csv COURIER_DAILY     "$DRIVE_COURIER"       & pid_courier=$!
+          fi
           bajar_csv CONNECTIONS       "$DRIVE_CONNECTIONS"   & pid_conn=$!
           bajar_csv CANCELLATIONS_RTA "$DRIVE_CANCELLATIONS" & pid_rta=$!
           pid_cancel=''; pid_late=''; pid_trips=''
@@ -139,10 +152,11 @@ jobs:
         env:
           SUPABASE_METRICS_URL: ${{ secrets.SUPABASE_METRICS_URL }}
           SUPABASE_METRICS_SERVICE_KEY: ${{ secrets.SUPABASE_METRICS_SERVICE_KEY }}
-          # Solo se suben a Supabase los días que de verdad pueden haber
-          # cambiado (las descargas traen --max-age 3d). Para un rebackfill
-          # completo, lanza el workflow a mano y sube este número a 21.
+          # Se suben a Supabase los últimos 21 días (Uber completa los días con
+          # retraso). Para rellenar más (p. ej. columnas nuevas), lanza el
+          # workflow a mano con dias_supabase = 60.
           SUPABASE_SYNC_DAYS: ${{ inputs.dias_supabase || '21' }}
+          REPROCESAR_DAILY_DESDE: ${{ inputs.reprocesar_desde }}
 
       - name: Tamaño de la salida
         run: |

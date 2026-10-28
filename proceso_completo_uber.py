@@ -186,6 +186,13 @@ DAILY_TEXT = {'driver_uuid', 'driver_name', 'driver_number', 'driver_email',
 DAILY_DATE = {'weekstr', 'datestr'}
 
 
+# El 13/10/2026 (12:09) Uber cambió los retrasos de COURIER_DAILY: quitó late_p2_trips / late_p3_trips y
+# puso p2_on_time / p2_late / OTR_p2 (y lo mismo para P3). Es otra medida: «late» es ahora todo pedido que no
+# llega a tiempo (unas 30 veces más que antes). Se guarda en las mismas columnas; el CRM decide con su
+# configuración cuántos retrasos por semana cuentan.
+DAILY_RENOMBRAR = {'p2_late': 'late_p2_trips', 'p3_late': 'late_p3_trips'}
+
+
 def parse_daily_csv(filepath, file_name, file_ts):
     sep = detect_sep(filepath)
     df = pl.read_csv(
@@ -193,6 +200,7 @@ def parse_daily_csv(filepath, file_name, file_ts):
         try_parse_dates=False, null_values=['', 'NA', 'null', 'NULL', '\\N'],
         truncate_ragged_lines=True,
     )
+    df = df.rename({a: b for a, b in DAILY_RENOMBRAR.items() if a in df.columns and b not in df.columns})
     for col in CANONICAL_DAILY:
         if col not in df.columns:
             if col in DAILY_DATE:   df = df.with_columns(pl.lit(None).cast(pl.Datetime).alias(col))
@@ -229,6 +237,19 @@ def ingest_bronze_daily():
         if not DAILY_PATTERN.search(name):
             continue
         files.append({'path': path, 'name': name, 'ts': extract_ts(name) or datetime.min})
+
+    # REPROCESAR_DAILY_DESDE=AAAA-MM-DD: vuelve a leer los ficheros de esa fecha en adelante (p. ej. tras un
+    # cambio de columnas de Uber). Solo se quitan del bronce los ficheros que están otra vez en disco, así que si
+    # la descarga falla no se pierde nada.
+    desde = os.environ.get('REPROCESAR_DAILY_DESDE', '').strip()
+    if desde and existing is not None:
+        limite = datetime.fromisoformat(desde)
+        en_disco = [f['name'] for f in files if f['ts'] >= limite]
+        antes = len(existing)
+        existing = existing.filter(~pl.col('file_name').is_in(en_disco))
+        processed = set(existing['file_name'].unique().to_list())
+        print(f"[daily] Reprocesar desde {desde}: {len(en_disco)} ficheros en disco, "
+              f"{antes - len(existing):,} filas del bronce se vuelven a leer")
 
     # ------------------------------------------------------------------ [FIX 1]
     # Se procesan TODAS las exportaciones, no solo la última de cada día.
@@ -1152,6 +1173,7 @@ def eventos_late(late):
     return lt.select([
         pl.col('driver_uuid').alias('courier_uuid'), 'delivery_trip_uuid',
         pl.col('day').cast(pl.Utf8), 'order_id', 'retraso_p2', 'retraso_p3',
+        (pl.col('retraso_p2') > 0).fill_null(False).alias('tarde_p2'), (pl.col('retraso_p3') > 0).fill_null(False).alias('tarde_p3'),
     ]).to_dicts()
 
 
@@ -1161,6 +1183,10 @@ def eventos_late(late):
 # varios nombres posibles y el fichero se descarta (con aviso) si falta alguno.
 TRIPS_DIR = os.environ.get('TRIPS_DIR', 'TRIPS_DATA')
 TRIPS_PATTERN = re.compile(r'trips.*\.csv$', re.IGNORECASE)
+# Columnas opcionales de TRIPS_DATA: los indicadores de puntualidad (desde mediados de octubre de 2026) y los
+# minutos real/estimado de recogida (P2) y entrega (P3), los mismos que traía LATE_TRIPS (allí en segundos).
+TRIPS_OPCIONALES = ['order_id', 'p2_on_time', 'p3_on_time', 'pickup_approach_minutes', 'estimated_pickup_approach_minutes',
+                    'dropoff_approach_minutes', 'estimated_dropoff_approach_minutes']
 TRIPS_CANDIDATAS = {
     'courier_uuid': ['driver_uuid', 'courier_uuid'],
     'trip_uuid': ['delivery_trip_uuid', 'trip_uuid', 'workflow_uuid', 'job_uuid', 'order_uuid'],
@@ -1193,6 +1219,7 @@ def _leer_csvs_trips():
             df = df.filter(pl.col('delivery_status') == 'COMPLETED')
         cols = [pl.col(c).alias(k) for k, c in elegidas.items()]
         cols.append((pl.col('form_factor') if 'form_factor' in df.columns else pl.lit(None, dtype=pl.Utf8)).alias('form_factor'))
+        cols += [(pl.col(c) if c in df.columns else pl.lit(None, dtype=pl.Utf8)).alias(c) for c in TRIPS_OPCIONALES]
         frames.append(df.select(cols).with_columns(pl.lit(extract_ts(name) or datetime(1970, 1, 1)).alias('_ts_fichero')))
     avisar_errores('trips', errores, total)
     return pl.concat(frames, how='vertical_relaxed') if frames else None
@@ -1209,6 +1236,31 @@ def pedidos_km(trips):
     return t.select(['courier_uuid', 'trip_uuid', pl.col('day').cast(pl.Utf8), 'km', 'form_factor']).to_dicts()
 
 
+def retrasos_trips(trips):
+    """
+    Pedidos que Uber marca fuera de hora (p2_on_time / p3_on_time = 0): lo que cuentan sus contadores diarios
+    p2_late / p3_late desde el 13/10/2026, cuando dejó de mandar LATE_TRIPS. Mismo formato que eventos_late
+    más las marcas tarde_p2 / tarde_p3 (la marca de Uber, no el signo de los minutos).
+    """
+    num = lambda c: pl.col(c).cast(pl.Float64, strict=False)
+    t = (trips
+         .filter((pl.col('p2_on_time') == '0').fill_null(False) | (pl.col('p3_on_time') == '0').fill_null(False))
+         .with_columns([
+             _dia_logico('momento').alias('day'),
+             (num('pickup_approach_minutes') - num('estimated_pickup_approach_minutes')).alias('retraso_p2'),
+             (num('dropoff_approach_minutes') - num('estimated_dropoff_approach_minutes')).alias('retraso_p3'),
+             (pl.col('p2_on_time') == '0').fill_null(False).alias('tarde_p2'),
+             (pl.col('p3_on_time') == '0').fill_null(False).alias('tarde_p3'),
+         ])
+         .filter(pl.col('courier_uuid').is_not_null() & pl.col('trip_uuid').is_not_null() & pl.col('day').is_not_null())
+         .sort('_ts_fichero')
+         .unique(subset=['courier_uuid', 'trip_uuid'], keep='last'))
+    return t.select([
+        'courier_uuid', pl.col('trip_uuid').alias('delivery_trip_uuid'), pl.col('day').cast(pl.Utf8), 'order_id',
+        'retraso_p2', 'retraso_p3', 'tarde_p2', 'tarde_p3',
+    ]).to_dicts()
+
+
 def sync_eventos_pedido():
     cancel = _leer_csvs_eventos(CANCEL_DIR, CANCEL_PATTERN, CANCEL_COLS, 'cancel')
     late = _leer_csvs_eventos(LATE_DIR, LATE_PATTERN, LATE_COLS, 'late')
@@ -1221,6 +1273,8 @@ def sync_eventos_pedido():
     for tabla, registros, conflicto in [
         ('uber_eventos_pedido', eventos_cancel(cancel) if cancel is not None else [], 'courier_uuid,delivery_trip_uuid,event_type'),
         ('uber_retrasos_pedido', eventos_late(late) if late is not None else [], 'courier_uuid,delivery_trip_uuid'),
+        # después de LATE_TRIPS: para un mismo pedido manda la marca de Uber
+        ('uber_retrasos_pedido', retrasos_trips(trips) if trips is not None else [], 'courier_uuid,delivery_trip_uuid'),
         ('uber_pedidos_km', pedidos_km(trips) if trips is not None else [], 'courier_uuid,trip_uuid'),
     ]:
         try:
