@@ -679,10 +679,11 @@ def build_silver(bronze_daily):
     if recalcs:
         silver = silver.with_columns(recalcs)
 
-    # Recorte a la ventana reciente para reprocesar rápido
+    # Recorte a la ventana reciente para reprocesar rápido. Nunca menos que los días que se suben a Supabase
+    # (SUPABASE_SYNC_DAYS): si no, un relleno a mano de 60 días solo subiría las últimas 3 semanas.
     max_day = silver.select(pl.col('datestr').max()).item()
     if max_day is not None:
-        cutoff = max_day - timedelta(weeks=REPROCESS_WEEKS)
+        cutoff = max_day - max(timedelta(weeks=REPROCESS_WEEKS), timedelta(days=int(os.environ.get('SUPABASE_SYNC_DAYS', '7'))))
         silver = silver.filter(pl.col('datestr') >= cutoff)
         print(f"[silver] Ventana: {cutoff.date()} → {max_day.date()} ({len(silver):,} filas)")
     return silver
